@@ -102,16 +102,19 @@ gitcat -m claude-opus-4-5-20251101
 
 ## Pull Request Generation
 
+After a successful push, gitcat will automatically check if a PR already exists for your branch. If no PR exists and your origin is GitHub, it will offer to create one.
+
 When you choose to create a PR, gitcat will:
 
 1. **Verify GitHub origin**: Checks that your remote is on github.com
-2. **Analyze git log**: Examines commits on your branch (compared to the default branch)
-3. **Generate PR content**: Uses Claude AI to create:
+2. **Check for existing PR**: Uses `gh pr list` to see if a PR already exists for this branch
+3. **Analyze git log**: Examines commits on your branch (compared to the default branch)
+4. **Generate PR content**: Uses Claude AI to create:
    - A clear, concise title summarizing the changes
    - A detailed body with bullet points, context, and any important notes
-4. **Create PR**: Uses `gh pr create` to submit the pull request
+5. **Create PR**: Uses `gh pr create` to submit the pull request
 
-The AI analyzes your commit history to understand the full scope of changes and generates appropriate PR documentation automatically.
+The AI analyzes your commit history to understand the full scope of changes and generates appropriate PR documentation automatically. If a PR already exists, the prompt is automatically skipped.
 
 ## Examples
 

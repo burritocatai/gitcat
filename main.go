@@ -168,6 +168,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.errorMsg = fmt.Sprintf("Error pushing: %v", err)
 						return m, tea.Quit
 					}
+					// Check if PR already exists or if origin is not GitHub
+					if err := isGitHubOrigin(); err != nil {
+						return m, tea.Quit
+					}
+					if hasExistingPR(m.currentBranch) {
+						return m, tea.Quit
+					}
 					m.phase = "pr_prompt"
 					m.cursor = 1
 					m.choices = []string{"Yes, create PR", "No, skip"}
@@ -180,6 +187,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.errorMsg = fmt.Sprintf("Error setting upstream: %v", err)
 						return m, tea.Quit
 					}
+					// Check if PR already exists (GitHub origin already verified earlier)
+					if hasExistingPR(m.currentBranch) {
+						return m, tea.Quit
+					}
 					m.phase = "pr_prompt"
 					m.cursor = 1
 					m.choices = []string{"Yes, create PR", "No, skip"}
@@ -188,10 +199,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			} else if m.phase == "pr_prompt" {
 				if m.cursor == 0 {
-					if err := isGitHubOrigin(); err != nil {
-						m.errorMsg = fmt.Sprintf("Cannot create PR: %v", err)
-						return m, tea.Quit
-					}
 					m.phase = "pr_generating"
 					return m, generatePRContent(m.currentBranch)
 				}
@@ -544,6 +551,18 @@ func isGitHubOrigin() error {
 	}
 
 	return nil
+}
+
+func hasExistingPR(branch string) bool {
+	cmd := exec.Command("gh", "pr", "list", "--head", branch, "--json", "number")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return false
+	}
+
+	// If output is "[]" there are no PRs, otherwise there's at least one
+	result := strings.TrimSpace(string(output))
+	return result != "[]" && result != ""
 }
 
 func getGitLog(branch string) (string, error) {
