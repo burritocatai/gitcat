@@ -1,0 +1,107 @@
+name: Update Version File and Create Tag
+
+on:
+  push:
+    branches:
+      - main  # Monitor the main branch
+    paths-ignore:
+      - 'patterns/**'
+      - '**/*.md'
+
+permissions:
+  contents: write  # Ensure the workflow has write permissions
+
+jobs:
+  update-version:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Get the latest tag
+        id: get_latest_tag
+        run: |
+          latest_tag=$(git tag --sort=-creatordate | head -n 1)
+          if [ -z "$latest_tag" ]; then
+            echo "No tags found, using default version"
+            latest_tag="v0.0.0"
+          fi
+          echo "Latest tag is: $latest_tag"
+          echo "tag=$latest_tag" >> $GITHUB_ENV  # Save the latest tag to environment file
+
+      - name: Increment patch version
+        id: increment_version
+        run: |
+          latest_tag=${{ env.tag }}
+          # Remove 'v' prefix if present
+          version_without_v=$(echo "$latest_tag" | sed 's/^v//')
+          
+          # Parse version components
+          major=$(echo "$version_without_v" | cut -d. -f1)
+          minor=$(echo "$version_without_v" | cut -d. -f2)
+          patch=$(echo "$version_without_v" | cut -d. -f3)
+          
+          # Handle case where parsing fails (fallback to 0.0.0)
+          if [ -z "$major" ] || [ -z "$minor" ] || [ -z "$patch" ]; then
+            major=0
+            minor=0
+            patch=0
+          fi
+          
+          # Increment patch version
+          new_patch=$((patch + 1))
+          new_version="${major}.${minor}.${new_patch}"
+          new_tag="v${new_version}"
+          
+          echo "New version is: $new_version"
+          echo "new_version=$new_version" >> $GITHUB_ENV  # Save the new version to environment file
+          echo "New tag is: $new_tag"
+          echo "new_tag=$new_tag" >> $GITHUB_ENV  # Save the new tag to environment file
+
+      - name: Update version.go file
+        run: |
+          echo "package main" > version.go
+          echo "" >> version.go
+          echo "const ( Version = \"${{ env.new_tag }}\" )" >> version.go
+      
+      - name: Commit changes
+        run: |
+          git add version.go
+          git add .
+          if ! git diff --staged --quiet; then
+            git commit -m "Update version to ${{ env.new_tag }}"
+          else
+            echo "No changes to commit."
+          fi
+
+      - name: Push changes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # Use GITHUB_TOKEN to authenticate the push
+        run: |
+          git push origin main  # Push changes to the main branch
+
+      - name: Create a new tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.TAG_PAT }}
+        run: |
+          git tag ${{ env.new_tag }}
+          git push origin ${{ env.new_tag }}  # Push the new tag
+
+      - name: Dispatch event to trigger release workflow
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # Use GITHUB_TOKEN to authenticate the dispatch
+        run: |
+          curl -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/dispatches \
+            -d '{"event_type": "tag_created", "client_payload": {"tag": "${{ env.new_tag }}"}}'
