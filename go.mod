@@ -1,4 +1,4 @@
-module gitcat
+module github.com/burritocatai/gitcat
 
 go 1.24.1
 
