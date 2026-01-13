@@ -59,9 +59,10 @@ type model struct {
 	needsAdd      bool
 	generatedMsg  string
 	errorMsg      string
+	currentBranch string
 }
 
-func initialModel(diff string, needsAdd bool) model {
+func initialModel(diff string, needsAdd bool, currentBranch string) model {
 	commitTypes := []string{"feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore"}
 
 	phase := "type"
@@ -70,12 +71,13 @@ func initialModel(diff string, needsAdd bool) model {
 	}
 
 	return model{
-		choices:      []string{"Yes, add all changes", "No, exit"},
-		commitTypes:  commitTypes,
-		typeSelected: 0,
-		phase:        phase,
-		diff:         diff,
-		needsAdd:     needsAdd,
+		choices:       []string{"Yes, add all changes", "No, exit"},
+		commitTypes:   commitTypes,
+		typeSelected:  0,
+		phase:         phase,
+		diff:          diff,
+		needsAdd:      needsAdd,
+		currentBranch: currentBranch,
 	}
 }
 
@@ -95,7 +97,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor--
 			} else if m.phase == "type" && m.typeSelected > 0 {
 				m.typeSelected--
-			} else if m.phase == "push_prompt" && m.cursor > 0 {
+			} else if (m.phase == "push_prompt" || m.phase == "upstream_prompt") && m.cursor > 0 {
 				m.cursor--
 			}
 
@@ -104,7 +106,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor++
 			} else if m.phase == "type" && m.typeSelected < len(m.commitTypes)-1 {
 				m.typeSelected++
-			} else if m.phase == "push_prompt" && m.cursor < len(m.choices)-1 {
+			} else if (m.phase == "push_prompt" || m.phase == "upstream_prompt") && m.cursor < len(m.choices)-1 {
 				m.cursor++
 			}
 
@@ -152,8 +154,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.choices = []string{"Yes, push", "No, skip"}
 			} else if m.phase == "push_prompt" {
 				if m.cursor == 0 {
-					if err := gitPush(); err != nil {
+					err := gitPush()
+					if err != nil {
+						errStr := err.Error()
+						if strings.Contains(errStr, "no upstream branch") || strings.Contains(errStr, "has no upstream branch") {
+							m.phase = "upstream_prompt"
+							m.cursor = 0
+							m.choices = []string{"Yes, set upstream and push", "No, skip"}
+							return m, nil
+						}
 						m.errorMsg = fmt.Sprintf("Error pushing: %v", err)
+						return m, tea.Quit
+					}
+				}
+				return m, tea.Quit
+			} else if m.phase == "upstream_prompt" {
+				if m.cursor == 0 {
+					if err := gitPushSetUpstream(m.currentBranch); err != nil {
+						m.errorMsg = fmt.Sprintf("Error setting upstream: %v", err)
 						return m, tea.Quit
 					}
 				}
@@ -264,6 +282,21 @@ func (m model) View() string {
 	if m.phase == "push_prompt" {
 		s := titleStyle.Render("✓ Commit created successfully!") + "\n\n"
 		s += titleStyle.Render("Push to remote?") + "\n\n"
+		for i, choice := range m.choices {
+			cursor := " "
+			if m.cursor == i {
+				cursor = ">"
+				choice = selectedStyle.Render(choice)
+			}
+			s += fmt.Sprintf("%s %s\n", cursor, choice)
+		}
+		s += "\n(use arrow keys to select, enter to confirm, q to quit)\n"
+		return s
+	}
+
+	if m.phase == "upstream_prompt" {
+		s := titleStyle.Render("No upstream branch configured.") + "\n\n"
+		s += titleStyle.Render(fmt.Sprintf("Set upstream to 'origin/%s' and push?", m.currentBranch)) + "\n\n"
 		for i, choice := range m.choices {
 			cursor := " "
 			if m.cursor == i {
@@ -419,6 +452,24 @@ func gitPush() error {
 	return nil
 }
 
+func getCurrentBranch() (string, error) {
+	cmd := exec.Command("git", "branch", "--show-current")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("git branch failed: %w", err)
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func gitPushSetUpstream(branch string) error {
+	cmd := exec.Command("git", "push", "--set-upstream", "origin", branch)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git push --set-upstream failed: %w\n%s", err, string(output))
+	}
+	return nil
+}
+
 func main() {
 	flag.Parse()
 
@@ -442,7 +493,13 @@ func main() {
 		needsAdd = true
 	}
 
-	p := tea.NewProgram(initialModel(diff, needsAdd))
+	currentBranch, err := getCurrentBranch()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error getting current branch: %v\n", err)
+		os.Exit(1)
+	}
+
+	p := tea.NewProgram(initialModel(diff, needsAdd, currentBranch))
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error running program: %v\n", err)
 		os.Exit(1)
