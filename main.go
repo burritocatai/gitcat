@@ -156,11 +156,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.errorMsg = fmt.Sprintf("Error pushing: %v", err)
 						return m, tea.Quit
 					}
-					m.phase = "done"
-				} else {
-					m.phase = "done"
 				}
-			} else if m.phase == "done" {
 				return m, tea.Quit
 			}
 
