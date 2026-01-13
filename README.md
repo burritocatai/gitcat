@@ -11,6 +11,7 @@ A Go CLI tool that generates conventional commit messages using Anthropic's Clau
 - ⚙️ Configurable model selection via CLI flags
 - 🚀 Smart git workflow (auto-detect unstaged changes, upstream branch setup)
 - 🔄 Optional push with automatic upstream branch detection
+- 🔀 AI-powered PR creation with automatic title and body generation (GitHub only)
 
 ## Installation
 
@@ -21,6 +22,25 @@ go install github.com/burritocatai/gitcat@v0.0.3
 Move the binary to your PATH:
 ```bash
 mv gitcat /usr/local/bin/
+```
+
+### PR Creation Requirements
+
+To use the PR creation feature, you need:
+- GitHub CLI (`gh`) installed and authenticated
+- Repository origin must be on github.com
+- Branch must be pushed to remote
+
+Install GitHub CLI:
+```bash
+# macOS
+brew install gh
+
+# Linux
+curl -sS https://webi.sh/gh | sh
+
+# Authenticate
+gh auth login
 ```
 
 ## Configuration
@@ -65,6 +85,7 @@ gitcat -m claude-opus-4-5-20251101
 7. **Commit**: Confirm to create the commit
 8. **Push** (optional): Choose whether to push to remote (defaults to "No")
 9. **Set upstream** (if needed): If no upstream branch exists, offers to set it automatically
+10. **Create PR** (optional): Generate and create a GitHub pull request (defaults to "No")
 
 ## Conventional Commit Types
 
@@ -78,6 +99,22 @@ gitcat -m claude-opus-4-5-20251101
 - `build`: Build system changes
 - `ci`: CI configuration changes
 - `chore`: Other changes
+
+## Pull Request Generation
+
+After a successful push, gitcat will automatically check if a PR already exists for your branch. If no PR exists and your origin is GitHub, it will offer to create one.
+
+When you choose to create a PR, gitcat will:
+
+1. **Verify GitHub origin**: Checks that your remote is on github.com
+2. **Check for existing PR**: Uses `gh pr list` to see if a PR already exists for this branch
+3. **Analyze git log**: Examines commits on your branch (compared to the default branch)
+4. **Generate PR content**: Uses Claude AI to create:
+   - A clear, concise title summarizing the changes
+   - A detailed body with bullet points, context, and any important notes
+5. **Create PR**: Uses `gh pr create` to submit the pull request
+
+The AI analyzes your commit history to understand the full scope of changes and generates appropriate PR documentation automatically. If a PR already exists, the prompt is automatically skipped.
 
 ## Examples
 
