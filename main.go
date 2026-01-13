@@ -60,6 +60,8 @@ type model struct {
 	generatedMsg  string
 	errorMsg      string
 	currentBranch string
+	prTitle       string
+	prBody        string
 }
 
 func initialModel(diff string, needsAdd bool, currentBranch string) model {
@@ -97,7 +99,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor--
 			} else if m.phase == "type" && m.typeSelected > 0 {
 				m.typeSelected--
-			} else if (m.phase == "push_prompt" || m.phase == "upstream_prompt") && m.cursor > 0 {
+			} else if (m.phase == "push_prompt" || m.phase == "upstream_prompt" || m.phase == "pr_prompt") && m.cursor > 0 {
 				m.cursor--
 			}
 
@@ -106,7 +108,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor++
 			} else if m.phase == "type" && m.typeSelected < len(m.commitTypes)-1 {
 				m.typeSelected++
-			} else if (m.phase == "push_prompt" || m.phase == "upstream_prompt") && m.cursor < len(m.choices)-1 {
+			} else if (m.phase == "push_prompt" || m.phase == "upstream_prompt" || m.phase == "pr_prompt") && m.cursor < len(m.choices)-1 {
 				m.cursor++
 			}
 
@@ -166,6 +168,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.errorMsg = fmt.Sprintf("Error pushing: %v", err)
 						return m, tea.Quit
 					}
+					m.phase = "pr_prompt"
+					m.cursor = 1
+					m.choices = []string{"Yes, create PR", "No, skip"}
+					return m, nil
 				}
 				return m, tea.Quit
 			} else if m.phase == "upstream_prompt" {
@@ -174,7 +180,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.errorMsg = fmt.Sprintf("Error setting upstream: %v", err)
 						return m, tea.Quit
 					}
+					m.phase = "pr_prompt"
+					m.cursor = 1
+					m.choices = []string{"Yes, create PR", "No, skip"}
+					return m, nil
 				}
+				return m, tea.Quit
+			} else if m.phase == "pr_prompt" {
+				if m.cursor == 0 {
+					if err := isGitHubOrigin(); err != nil {
+						m.errorMsg = fmt.Sprintf("Cannot create PR: %v", err)
+						return m, tea.Quit
+					}
+					m.phase = "pr_generating"
+					return m, generatePRContent(m.currentBranch)
+				}
+				return m, tea.Quit
+			} else if m.phase == "pr_creating" {
 				return m, tea.Quit
 			}
 
@@ -202,6 +224,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.phase = "confirm"
 		m.cursor = 0
 		m.choices = []string{"Yes, commit", "No, let me edit"}
+
+	case prContentMsg:
+		parts := strings.SplitN(string(msg), "\n---BODY---\n", 2)
+		if len(parts) == 2 {
+			m.prTitle = parts[0]
+			m.prBody = parts[1]
+		} else {
+			m.prTitle = string(msg)
+			m.prBody = ""
+		}
+		if err := createPR(m.prTitle, m.prBody); err != nil {
+			m.errorMsg = fmt.Sprintf("Error creating PR: %v", err)
+			return m, tea.Quit
+		}
+		m.phase = "pr_creating"
 
 	case errMsg:
 		m.errorMsg = string(msg)
@@ -309,6 +346,30 @@ func (m model) View() string {
 		return s
 	}
 
+	if m.phase == "pr_prompt" {
+		s := titleStyle.Render("Create a pull request?") + "\n\n"
+		for i, choice := range m.choices {
+			cursor := " "
+			if m.cursor == i {
+				cursor = ">"
+				choice = selectedStyle.Render(choice)
+			}
+			s += fmt.Sprintf("%s %s\n", cursor, choice)
+		}
+		s += "\n(use arrow keys to select, enter to confirm, q to quit)\n"
+		return s
+	}
+
+	if m.phase == "pr_generating" {
+		return titleStyle.Render("Generating PR title and body...") + "\n"
+	}
+
+	if m.phase == "pr_creating" {
+		s := titleStyle.Render("✓ Pull request created successfully!") + "\n\n"
+		s += fmt.Sprintf("Title: %s\n", m.prTitle)
+		return s
+	}
+
 	if m.phase == "done" {
 		return titleStyle.Render("✓ Done!") + "\n"
 	}
@@ -317,6 +378,7 @@ func (m model) View() string {
 }
 
 type commitMsgMsg string
+type prContentMsg string
 type errMsg string
 
 func generateCommitMsg(diff, commitType, scope string) tea.Cmd {
@@ -466,6 +528,160 @@ func gitPushSetUpstream(branch string) error {
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("git push --set-upstream failed: %w\n%s", err, string(output))
+	}
+	return nil
+}
+
+func isGitHubOrigin() error {
+	cmd := exec.Command("git", "remote", "get-url", "origin")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to get origin URL: %w", err)
+	}
+
+	originURL := strings.TrimSpace(string(output))
+	if !strings.Contains(originURL, "github.com") {
+		return fmt.Errorf("origin is not GitHub (found: %s). Only GitHub repositories are supported for PR creation", originURL)
+	}
+
+	return nil
+}
+
+func getGitLog(branch string) (string, error) {
+	// Get the default branch (usually main or master)
+	cmd := exec.Command("git", "remote", "show", "origin")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("failed to get remote info: %w", err)
+	}
+
+	// Parse the default branch
+	defaultBranch := "main"
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "HEAD branch:") {
+			parts := strings.Split(line, ":")
+			if len(parts) == 2 {
+				defaultBranch = strings.TrimSpace(parts[1])
+			}
+			break
+		}
+	}
+
+	// Get commits that are on current branch but not on default branch
+	cmd = exec.Command("git", "log", fmt.Sprintf("origin/%s..%s", defaultBranch, branch), "--pretty=format:%s%n%b%n---")
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		// If the branch comparison fails, just get recent commits
+		cmd = exec.Command("git", "log", "-10", "--pretty=format:%s%n%b%n---")
+		output, err = cmd.CombinedOutput()
+		if err != nil {
+			return "", fmt.Errorf("failed to get git log: %w", err)
+		}
+	}
+
+	return string(output), nil
+}
+
+func generatePRContent(branch string) tea.Cmd {
+	return func() tea.Msg {
+		apiKey := os.Getenv("ANTHROPIC_API_KEY")
+		if apiKey == "" {
+			return errMsg("ANTHROPIC_API_KEY environment variable not set")
+		}
+
+		model := *modelFlag
+		if *mFlag != "" {
+			model = *mFlag
+		}
+
+		gitLog, err := getGitLog(branch)
+		if err != nil {
+			return errMsg(fmt.Sprintf("Error getting git log: %v", err))
+		}
+
+		prompt := fmt.Sprintf(`You are a pull request generator. Based on the following git log from a branch, generate a clear and concise pull request title and body.
+
+Git log:
+%s
+
+Generate:
+1. A clear, concise PR title (max 72 characters) that summarizes the changes
+2. A detailed PR body that:
+   - Summarizes the changes in bullet points
+   - Explains the motivation and context
+   - Notes any breaking changes or important details
+
+Format your response as:
+[PR Title]
+---BODY---
+[PR Body]
+
+Respond with ONLY the title and body in this format, no explanations or markdown code blocks.`, gitLog)
+
+		reqBody := AnthropicRequest{
+			Model:     model,
+			MaxTokens: 2048,
+			Messages: []Message{
+				{
+					Role:    "user",
+					Content: prompt,
+				},
+			},
+		}
+
+		jsonData, err := json.Marshal(reqBody)
+		if err != nil {
+			return errMsg(fmt.Sprintf("Error marshaling request: %v", err))
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(ctx, "POST", anthropicURL, bytes.NewBuffer(jsonData))
+		if err != nil {
+			return errMsg(fmt.Sprintf("Error creating request: %v", err))
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-api-key", apiKey)
+		req.Header.Set("anthropic-version", "2023-06-01")
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			return errMsg(fmt.Sprintf("Error making request: %v", err))
+		}
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return errMsg(fmt.Sprintf("Error reading response: %v", err))
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			return errMsg(fmt.Sprintf("API error (%d): %s", resp.StatusCode, string(body)))
+		}
+
+		var apiResp AnthropicResponse
+		if err := json.Unmarshal(body, &apiResp); err != nil {
+			return errMsg(fmt.Sprintf("Error parsing response: %v", err))
+		}
+
+		if len(apiResp.Content) == 0 {
+			return errMsg("No content in API response")
+		}
+
+		prContent := strings.TrimSpace(apiResp.Content[0].Text)
+		return prContentMsg(prContent)
+	}
+}
+
+func createPR(title, body string) error {
+	cmd := exec.Command("gh", "pr", "create", "--title", title, "--body", body)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("gh pr create failed: %w\n%s", err, string(output))
 	}
 	return nil
 }
