@@ -95,6 +95,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor--
 			} else if m.phase == "type" && m.typeSelected > 0 {
 				m.typeSelected--
+			} else if m.phase == "push_prompt" && m.cursor > 0 {
+				m.cursor--
 			}
 
 		case "down", "j":
@@ -102,6 +104,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor++
 			} else if m.phase == "type" && m.typeSelected < len(m.commitTypes)-1 {
 				m.typeSelected++
+			} else if m.phase == "push_prompt" && m.cursor < len(m.choices)-1 {
+				m.cursor++
 			}
 
 		case "enter":
@@ -132,7 +136,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.errorMsg = fmt.Sprintf("Error committing: %v", err)
 						return m, tea.Quit
 					}
-					m.phase = "done"
+					m.phase = "push_prompt"
+					m.cursor = 1
+					m.choices = []string{"Yes, push", "No, skip"}
 				} else {
 					m.phase = "edit"
 				}
@@ -141,7 +147,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.errorMsg = fmt.Sprintf("Error committing: %v", err)
 					return m, tea.Quit
 				}
-				m.phase = "done"
+				m.phase = "push_prompt"
+				m.cursor = 1
+				m.choices = []string{"Yes, push", "No, skip"}
+			} else if m.phase == "push_prompt" {
+				if m.cursor == 0 {
+					if err := gitPush(); err != nil {
+						m.errorMsg = fmt.Sprintf("Error pushing: %v", err)
+						return m, tea.Quit
+					}
+					m.phase = "done"
+				} else {
+					m.phase = "done"
+				}
 			} else if m.phase == "done" {
 				return m, tea.Quit
 			}
@@ -247,8 +265,23 @@ func (m model) View() string {
 		return s
 	}
 
+	if m.phase == "push_prompt" {
+		s := titleStyle.Render("✓ Commit created successfully!") + "\n\n"
+		s += titleStyle.Render("Push to remote?") + "\n\n"
+		for i, choice := range m.choices {
+			cursor := " "
+			if m.cursor == i {
+				cursor = ">"
+				choice = selectedStyle.Render(choice)
+			}
+			s += fmt.Sprintf("%s %s\n", cursor, choice)
+		}
+		s += "\n(use arrow keys to select, enter to confirm, q to quit)\n"
+		return s
+	}
+
 	if m.phase == "done" {
-		return titleStyle.Render("✓ Commit created successfully!") + "\n"
+		return titleStyle.Render("✓ Done!") + "\n"
 	}
 
 	return ""
@@ -374,8 +407,18 @@ func gitAdd() error {
 
 func gitCommit(message string) error {
 	cmd := exec.Command("git", "commit", "-m", message)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("git commit failed: %w", err)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git commit failed: %w\n%s", err, string(output))
+	}
+	return nil
+}
+
+func gitPush() error {
+	cmd := exec.Command("git", "push")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git push failed: %w\n%s", err, string(output))
 	}
 	return nil
 }

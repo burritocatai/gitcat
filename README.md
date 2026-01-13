@@ -14,7 +14,7 @@ A Go CLI tool that generates conventional commit messages using Anthropic's Clau
 ## Installation
 
 ```bash
-go build -o gitcat
+go install github.com/burritocatai/gitcat@v0.0.3
 ```
 
 Move the binary to your PATH:
@@ -62,6 +62,7 @@ gitcat -m claude-opus-4-5-20251101
 5. **AI generation**: Claude generates a commit message based on your diff
 6. **Review & edit**: Review the generated message and optionally edit it
 7. **Commit**: Confirm to create the commit
+8. **Push** (optional): Choose whether to push to remote (defaults to "No")
 
 ## Conventional Commit Types
 
