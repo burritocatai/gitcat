@@ -9,7 +9,8 @@ A Go CLI tool that generates conventional commit messages using Anthropic's Clau
 - 🎨 Interactive terminal UI with dropdown selections
 - 🔐 Secure API key management via environment variables (1Password compatible)
 - ⚙️ Configurable model selection via CLI flags
-- 🚀 Smart git workflow (auto-detect unstaged changes)
+- 🚀 Smart git workflow (auto-detect unstaged changes, upstream branch setup)
+- 🔄 Optional push with automatic upstream branch detection
 
 ## Installation
 
@@ -63,6 +64,7 @@ gitcat -m claude-opus-4-5-20251101
 6. **Review & edit**: Review the generated message and optionally edit it
 7. **Commit**: Confirm to create the commit
 8. **Push** (optional): Choose whether to push to remote (defaults to "No")
+9. **Set upstream** (if needed): If no upstream branch exists, offers to set it automatically
 
 ## Conventional Commit Types
 
