@@ -196,8 +196,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, generatePRContent(m.currentBranch)
 				}
 				return m, tea.Quit
-			} else if m.phase == "pr_creating" {
-				return m, tea.Quit
 			}
 
 		case "backspace":
@@ -239,6 +237,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		m.phase = "pr_creating"
+		return m, tea.Quit
 
 	case errMsg:
 		m.errorMsg = string(msg)
