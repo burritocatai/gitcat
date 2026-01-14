@@ -105,25 +105,49 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case "up", "k":
-			if m.phase == "branch_warning" && m.cursor > 0 {
-				m.cursor--
-			} else if m.phase == "add" && m.cursor > 0 {
-				m.cursor--
-			} else if m.phase == "type" && m.typeSelected > 0 {
-				m.typeSelected--
-			} else if (m.phase == "push_prompt" || m.phase == "upstream_prompt" || m.phase == "pr_prompt") && m.cursor > 0 {
-				m.cursor--
+			// Only handle as navigation if not in input phase
+			if m.phase != "branch_input" && m.phase != "scope" && m.phase != "edit" {
+				if m.phase == "branch_warning" && m.cursor > 0 {
+					m.cursor--
+				} else if m.phase == "add" && m.cursor > 0 {
+					m.cursor--
+				} else if m.phase == "type" && m.typeSelected > 0 {
+					m.typeSelected--
+				} else if (m.phase == "push_prompt" || m.phase == "upstream_prompt" || m.phase == "pr_prompt") && m.cursor > 0 {
+					m.cursor--
+				}
+			} else if msg.String() == "k" && len(msg.String()) == 1 {
+				// Allow typing 'k' in input phases
+				if m.phase == "branch_input" {
+					m.branchInput += msg.String()
+				} else if m.phase == "scope" {
+					m.scopeInput += msg.String()
+				} else if m.phase == "edit" {
+					m.generatedMsg += msg.String()
+				}
 			}
 
 		case "down", "j":
-			if m.phase == "branch_warning" && m.cursor < len(m.choices)-1 {
-				m.cursor++
-			} else if m.phase == "add" && m.cursor < len(m.choices)-1 {
-				m.cursor++
-			} else if m.phase == "type" && m.typeSelected < len(m.commitTypes)-1 {
-				m.typeSelected++
-			} else if (m.phase == "push_prompt" || m.phase == "upstream_prompt" || m.phase == "pr_prompt") && m.cursor < len(m.choices)-1 {
-				m.cursor++
+			// Only handle as navigation if not in input phase
+			if m.phase != "branch_input" && m.phase != "scope" && m.phase != "edit" {
+				if m.phase == "branch_warning" && m.cursor < len(m.choices)-1 {
+					m.cursor++
+				} else if m.phase == "add" && m.cursor < len(m.choices)-1 {
+					m.cursor++
+				} else if m.phase == "type" && m.typeSelected < len(m.commitTypes)-1 {
+					m.typeSelected++
+				} else if (m.phase == "push_prompt" || m.phase == "upstream_prompt" || m.phase == "pr_prompt") && m.cursor < len(m.choices)-1 {
+					m.cursor++
+				}
+			} else if msg.String() == "j" && len(msg.String()) == 1 {
+				// Allow typing 'j' in input phases
+				if m.phase == "branch_input" {
+					m.branchInput += msg.String()
+				} else if m.phase == "scope" {
+					m.scopeInput += msg.String()
+				} else if m.phase == "edit" {
+					m.generatedMsg += msg.String()
+				}
 			}
 
 		case "enter":
