@@ -48,38 +48,48 @@ type ContentBlock struct {
 }
 
 type model struct {
-	choices       []string
-	cursor        int
-	selected      map[int]struct{}
-	commitTypes   []string
-	typeSelected  int
-	scopeInput    string
-	phase         string
-	diff          string
-	needsAdd      bool
-	generatedMsg  string
-	errorMsg      string
-	currentBranch string
-	prTitle       string
-	prBody        string
+	choices           []string
+	cursor            int
+	selected          map[int]struct{}
+	commitTypes       []string
+	typeSelected      int
+	scopeInput        string
+	phase             string
+	diff              string
+	needsAdd          bool
+	generatedMsg      string
+	errorMsg          string
+	currentBranch     string
+	prTitle           string
+	prBody            string
+	isProtectedBranch bool   // Track if on main/master
+	branchInput       string // User input for branch name
 }
 
-func initialModel(diff string, needsAdd bool, currentBranch string) model {
+func initialModel(diff string, needsAdd bool, currentBranch string, isProtectedBranch bool) model {
 	commitTypes := []string{"feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore"}
 
+	// Determine initial phase based on conditions
 	phase := "type"
-	if needsAdd {
+	choices := []string{"Yes, add all changes", "No, exit"}
+
+	if isProtectedBranch {
+		phase = "branch_warning"
+		choices = []string{"Yes, create a new branch", fmt.Sprintf("No, continue on %s", currentBranch)}
+	} else if needsAdd {
 		phase = "add"
 	}
 
 	return model{
-		choices:       []string{"Yes, add all changes", "No, exit"},
-		commitTypes:   commitTypes,
-		typeSelected:  0,
-		phase:         phase,
-		diff:          diff,
-		needsAdd:      needsAdd,
-		currentBranch: currentBranch,
+		choices:           choices,
+		commitTypes:       commitTypes,
+		typeSelected:      0,
+		phase:             phase,
+		diff:              diff,
+		needsAdd:          needsAdd,
+		currentBranch:     currentBranch,
+		isProtectedBranch: isProtectedBranch,
+		branchInput:       generateDefaultBranchName(),
 	}
 }
 
@@ -95,7 +105,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case "up", "k":
-			if m.phase == "add" && m.cursor > 0 {
+			if m.phase == "branch_warning" && m.cursor > 0 {
+				m.cursor--
+			} else if m.phase == "add" && m.cursor > 0 {
 				m.cursor--
 			} else if m.phase == "type" && m.typeSelected > 0 {
 				m.typeSelected--
@@ -104,7 +116,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "down", "j":
-			if m.phase == "add" && m.cursor < len(m.choices)-1 {
+			if m.phase == "branch_warning" && m.cursor < len(m.choices)-1 {
+				m.cursor++
+			} else if m.phase == "add" && m.cursor < len(m.choices)-1 {
 				m.cursor++
 			} else if m.phase == "type" && m.typeSelected < len(m.commitTypes)-1 {
 				m.typeSelected++
@@ -113,7 +127,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "enter":
-			if m.phase == "add" {
+			if m.phase == "branch_warning" {
+				if m.cursor == 0 {
+					// User wants to create new branch
+					m.phase = "branch_input"
+				} else {
+					// User wants to continue on main/master
+					// Move to next phase in normal flow
+					if m.needsAdd {
+						m.phase = "add"
+						m.cursor = 0
+						m.choices = []string{"Yes, add all changes", "No, exit"}
+					} else {
+						m.phase = "type"
+					}
+				}
+			} else if m.phase == "branch_input" {
+				// Validate branch name
+				if err := validateBranchName(m.branchInput); err != nil {
+					m.errorMsg = err.Error()
+					return m, tea.Quit
+				}
+				// User submitted branch name
+				m.phase = "branch_creating"
+				return m, createAndCheckoutBranch(m.branchInput)
+			} else if m.phase == "add" {
 				if m.cursor == 0 {
 					if err := gitAdd(); err != nil {
 						m.errorMsg = fmt.Sprintf("Error adding files: %v", err)
@@ -206,14 +244,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "backspace":
-			if m.phase == "scope" && len(m.scopeInput) > 0 {
+			if m.phase == "branch_input" && len(m.branchInput) > 0 {
+				m.branchInput = m.branchInput[:len(m.branchInput)-1]
+			} else if m.phase == "scope" && len(m.scopeInput) > 0 {
 				m.scopeInput = m.scopeInput[:len(m.scopeInput)-1]
 			} else if m.phase == "edit" && len(m.generatedMsg) > 0 {
 				m.generatedMsg = m.generatedMsg[:len(m.generatedMsg)-1]
 			}
 
 		default:
-			if m.phase == "scope" && len(msg.String()) == 1 {
+			if m.phase == "branch_input" && len(msg.String()) == 1 {
+				m.branchInput += msg.String()
+			} else if m.phase == "scope" && len(msg.String()) == 1 {
 				m.scopeInput += msg.String()
 			} else if m.phase == "edit" {
 				if msg.String() == "enter" {
@@ -246,6 +288,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.phase = "pr_creating"
 		return m, tea.Quit
 
+	case branchCreatedMsg:
+		// Branch created successfully, update current branch name
+		m.currentBranch = string(msg)
+		// Continue to normal flow
+		if m.needsAdd {
+			m.phase = "add"
+			m.cursor = 0
+			m.choices = []string{"Yes, add all changes", "No, exit"}
+		} else {
+			m.phase = "type"
+		}
+
 	case errMsg:
 		m.errorMsg = string(msg)
 		return m, tea.Quit
@@ -260,6 +314,38 @@ func (m model) View() string {
 
 	if m.errorMsg != "" {
 		return fmt.Sprintf("Error: %s\n", m.errorMsg)
+	}
+
+	if m.phase == "branch_warning" {
+		warningStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
+		s := titleStyle.Render("⚠️  Warning: You are on a protected branch!") + "\n\n"
+		s += warningStyle.Render(fmt.Sprintf("Current branch: %s", m.currentBranch)) + "\n\n"
+		s += "Committing directly to main/master branches is not recommended.\n"
+		s += "Would you like to create a new branch instead?\n\n"
+
+		for i, choice := range m.choices {
+			cursor := " "
+			if m.cursor == i {
+				cursor = ">"
+				choice = selectedStyle.Render(choice)
+			}
+			s += fmt.Sprintf("%s %s\n", cursor, choice)
+		}
+		s += "\n(use arrow keys to select, enter to confirm, q to quit)\n"
+		return s
+	}
+
+	if m.phase == "branch_input" {
+		s := titleStyle.Render("Enter new branch name:") + "\n\n"
+		s += lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(fmt.Sprintf("Suggested: %s", generateDefaultBranchName())) + "\n\n"
+		s += fmt.Sprintf("> %s_\n\n", m.branchInput)
+		s += lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("Tip: Use format like 'feature/description' or 'fix/issue-123'") + "\n"
+		s += "\n(type branch name, enter to create, q to quit)\n"
+		return s
+	}
+
+	if m.phase == "branch_creating" {
+		return titleStyle.Render(fmt.Sprintf("Creating and switching to branch '%s'...", m.branchInput)) + "\n"
 	}
 
 	if m.phase == "add" {
@@ -386,6 +472,7 @@ func (m model) View() string {
 type commitMsgMsg string
 type prContentMsg string
 type errMsg string
+type branchCreatedMsg string
 
 func generateCommitMsg(diff, commitType, scope string) tea.Cmd {
 	return func() tea.Msg {
@@ -536,6 +623,52 @@ func gitPushSetUpstream(branch string) error {
 		return fmt.Errorf("git push --set-upstream failed: %w\n%s", err, string(output))
 	}
 	return nil
+}
+
+func validateBranchName(name string) error {
+	if name == "" {
+		return fmt.Errorf("branch name cannot be empty")
+	}
+	if strings.HasPrefix(name, "-") {
+		return fmt.Errorf("branch name cannot start with a hyphen")
+	}
+	// Check for invalid characters (git doesn't allow certain chars)
+	invalidChars := []string{"..", "~", "^", ":", "?", "*", "[", "\\", " "}
+	for _, invalid := range invalidChars {
+		if strings.Contains(name, invalid) {
+			return fmt.Errorf("branch name contains invalid character: %s", invalid)
+		}
+	}
+	return nil
+}
+
+func generateDefaultBranchName() string {
+	// Get current timestamp for uniqueness
+	now := time.Now()
+	dateStr := now.Format("2006-01-02")
+
+	// Try to get git username
+	cmd := exec.Command("git", "config", "user.name")
+	output, err := cmd.CombinedOutput()
+	userName := "dev"
+	if err == nil && len(output) > 0 {
+		userName = strings.ToLower(strings.TrimSpace(string(output)))
+		userName = strings.ReplaceAll(userName, " ", "-")
+	}
+
+	return fmt.Sprintf("%s/feature-%s", userName, dateStr)
+}
+
+func createAndCheckoutBranch(branchName string) tea.Cmd {
+	return func() tea.Msg {
+		// Create and checkout the branch
+		cmd := exec.Command("git", "checkout", "-b", branchName)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return errMsg(fmt.Sprintf("Failed to create branch: %v\n%s", err, string(output)))
+		}
+		return branchCreatedMsg(branchName)
+	}
 }
 
 func isGitHubOrigin() error {
@@ -733,7 +866,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	p := tea.NewProgram(initialModel(diff, needsAdd, currentBranch))
+	isProtectedBranch := currentBranch == "main" || currentBranch == "master"
+
+	p := tea.NewProgram(initialModel(diff, needsAdd, currentBranch, isProtectedBranch))
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error running program: %v\n", err)
 		os.Exit(1)
