@@ -18,8 +18,9 @@ import (
 )
 
 const (
-	defaultModel = "claude-sonnet-4-5-20250929"
-	anthropicURL = "https://api.anthropic.com/v1/messages"
+	defaultModel       = "claude-sonnet-4-5-20250929"
+	anthropicURL       = "https://api.anthropic.com/v1/messages"
+	diffLineSizeLimit  = 1000 // Skip AI generation for diffs larger than this
 )
 
 var (
@@ -106,7 +107,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "up", "k":
 			// Only handle as navigation if not in input phase
-			if m.phase != "branch_input" && m.phase != "scope" && m.phase != "edit" {
+			if m.phase != "branch_input" && m.phase != "scope" && m.phase != "edit" && m.phase != "manual_input" {
 				if m.phase == "branch_warning" && m.cursor > 0 {
 					m.cursor--
 				} else if m.phase == "add" && m.cursor > 0 {
@@ -122,14 +123,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.branchInput += msg.String()
 				} else if m.phase == "scope" {
 					m.scopeInput += msg.String()
-				} else if m.phase == "edit" {
+				} else if m.phase == "edit" || m.phase == "manual_input" {
 					m.generatedMsg += msg.String()
 				}
 			}
 
 		case "down", "j":
 			// Only handle as navigation if not in input phase
-			if m.phase != "branch_input" && m.phase != "scope" && m.phase != "edit" {
+			if m.phase != "branch_input" && m.phase != "scope" && m.phase != "edit" && m.phase != "manual_input" {
 				if m.phase == "branch_warning" && m.cursor < len(m.choices)-1 {
 					m.cursor++
 				} else if m.phase == "add" && m.cursor < len(m.choices)-1 {
@@ -145,7 +146,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.branchInput += msg.String()
 				} else if m.phase == "scope" {
 					m.scopeInput += msg.String()
-				} else if m.phase == "edit" {
+				} else if m.phase == "edit" || m.phase == "manual_input" {
 					m.generatedMsg += msg.String()
 				}
 			}
@@ -194,8 +195,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else if m.phase == "type" {
 				m.phase = "scope"
 			} else if m.phase == "scope" {
-				m.phase = "generating"
-				return m, generateCommitMsg(m.diff, m.commitTypes[m.typeSelected], m.scopeInput)
+				// Check if diff is too large
+				if isDiffTooLarge(m.diff) {
+					m.phase = "manual_input"
+					m.generatedMsg = "" // Start with empty message for manual input
+				} else {
+					m.phase = "generating"
+					return m, generateCommitMsg(m.diff, m.commitTypes[m.typeSelected], m.scopeInput)
+				}
 			} else if m.phase == "confirm" {
 				if m.cursor == 0 {
 					if err := gitCommit(m.generatedMsg); err != nil {
@@ -208,7 +215,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else {
 					m.phase = "edit"
 				}
-			} else if m.phase == "edit" {
+			} else if m.phase == "edit" || m.phase == "manual_input" {
 				if err := gitCommit(m.generatedMsg); err != nil {
 					m.errorMsg = fmt.Sprintf("Error committing: %v", err)
 					return m, tea.Quit
@@ -272,7 +279,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.branchInput = m.branchInput[:len(m.branchInput)-1]
 			} else if m.phase == "scope" && len(m.scopeInput) > 0 {
 				m.scopeInput = m.scopeInput[:len(m.scopeInput)-1]
-			} else if m.phase == "edit" && len(m.generatedMsg) > 0 {
+			} else if (m.phase == "edit" || m.phase == "manual_input") && len(m.generatedMsg) > 0 {
 				m.generatedMsg = m.generatedMsg[:len(m.generatedMsg)-1]
 			}
 
@@ -281,7 +288,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.branchInput += msg.String()
 			} else if m.phase == "scope" && len(msg.String()) == 1 {
 				m.scopeInput += msg.String()
-			} else if m.phase == "edit" {
+			} else if m.phase == "edit" || m.phase == "manual_input" {
 				if msg.String() == "enter" {
 					m.generatedMsg += "\n"
 				} else if len(msg.String()) == 1 {
@@ -429,6 +436,17 @@ func (m model) View() string {
 	if m.phase == "edit" {
 		s := titleStyle.Render("Edit commit message (press enter when done):") + "\n\n"
 		s += fmt.Sprintf("%s_\n", m.generatedMsg)
+		return s
+	}
+
+	if m.phase == "manual_input" {
+		warningStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
+		s := titleStyle.Render("⚠️  Large diff detected") + "\n\n"
+		s += warningStyle.Render(fmt.Sprintf("The diff is too large (>%d lines) to send to the API.", diffLineSizeLimit)) + "\n"
+		s += "Please enter your commit message manually:\n\n"
+		s += fmt.Sprintf("%s(%s): %s_\n\n", m.commitTypes[m.typeSelected], m.scopeInput, m.generatedMsg)
+		s += lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("Tip: Follow conventional commits format") + "\n"
+		s += "\n(type your message, press enter when done)\n"
 		return s
 	}
 
@@ -594,6 +612,11 @@ func getGitDiff() (string, error) {
 		return "", fmt.Errorf("git diff failed: %w", err)
 	}
 	return string(output), nil
+}
+
+func isDiffTooLarge(diff string) bool {
+	lines := strings.Split(diff, "\n")
+	return len(lines) > diffLineSizeLimit
 }
 
 func getGitStatus() (bool, error) {
