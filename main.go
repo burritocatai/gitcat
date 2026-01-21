@@ -72,6 +72,9 @@ type model struct {
 	didPush         bool
 	didCreatePR     bool
 	createdBranch   string // Non-empty if a new branch was created
+
+	// API error context for retry capability
+	apiErrorMsg string // Stores the API error message to display
 }
 
 func initialModel(diff string, needsAdd bool, currentBranch string, isProtectedBranch bool) model {
@@ -114,14 +117,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "up", "k":
 			// Only handle as navigation if not in input phase
-			if m.phase != "branch_input" && m.phase != "scope" && m.phase != "edit" && m.phase != "manual_input" {
+			if m.phase != "branch_input" && m.phase != "scope" && m.phase != "edit" && m.phase != "manual_input" && m.phase != "pr_manual_title" && m.phase != "pr_manual_body" {
 				if m.phase == "branch_warning" && m.cursor > 0 {
 					m.cursor--
 				} else if m.phase == "add" && m.cursor > 0 {
 					m.cursor--
 				} else if m.phase == "type" && m.typeSelected > 0 {
 					m.typeSelected--
-				} else if (m.phase == "push_prompt" || m.phase == "upstream_prompt" || m.phase == "pr_prompt") && m.cursor > 0 {
+				} else if (m.phase == "push_prompt" || m.phase == "upstream_prompt" || m.phase == "pr_prompt" || m.phase == "confirm" || m.phase == "commit_error" || m.phase == "pr_error") && m.cursor > 0 {
 					m.cursor--
 				}
 			} else if msg.String() == "k" && len(msg.String()) == 1 {
@@ -132,19 +135,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.scopeInput += msg.String()
 				} else if m.phase == "edit" || m.phase == "manual_input" {
 					m.generatedMsg += msg.String()
+				} else if m.phase == "pr_manual_title" {
+					m.prTitle += msg.String()
+				} else if m.phase == "pr_manual_body" {
+					m.prBody += msg.String()
 				}
 			}
 
 		case "down", "j":
 			// Only handle as navigation if not in input phase
-			if m.phase != "branch_input" && m.phase != "scope" && m.phase != "edit" && m.phase != "manual_input" {
+			if m.phase != "branch_input" && m.phase != "scope" && m.phase != "edit" && m.phase != "manual_input" && m.phase != "pr_manual_title" && m.phase != "pr_manual_body" {
 				if m.phase == "branch_warning" && m.cursor < len(m.choices)-1 {
 					m.cursor++
 				} else if m.phase == "add" && m.cursor < len(m.choices)-1 {
 					m.cursor++
 				} else if m.phase == "type" && m.typeSelected < len(m.commitTypes)-1 {
 					m.typeSelected++
-				} else if (m.phase == "push_prompt" || m.phase == "upstream_prompt" || m.phase == "pr_prompt") && m.cursor < len(m.choices)-1 {
+				} else if (m.phase == "push_prompt" || m.phase == "upstream_prompt" || m.phase == "pr_prompt" || m.phase == "confirm" || m.phase == "commit_error" || m.phase == "pr_error") && m.cursor < len(m.choices)-1 {
 					m.cursor++
 				}
 			} else if msg.String() == "j" && len(msg.String()) == 1 {
@@ -155,6 +162,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.scopeInput += msg.String()
 				} else if m.phase == "edit" || m.phase == "manual_input" {
 					m.generatedMsg += msg.String()
+				} else if m.phase == "pr_manual_title" {
+					m.prTitle += msg.String()
+				} else if m.phase == "pr_manual_body" {
+					m.prBody += msg.String()
 				}
 			}
 
@@ -291,6 +302,48 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.phase = "exiting"
 				return m, tea.Quit
+			} else if m.phase == "commit_error" {
+				if m.cursor == 0 {
+					// Retry
+					m.phase = "generating"
+					m.apiErrorMsg = ""
+					return m, generateCommitMsg(m.diff, m.commitTypes[m.typeSelected], m.scopeInput)
+				} else {
+					// Enter commit message manually
+					m.phase = "manual_input"
+					m.generatedMsg = ""
+					m.apiErrorMsg = ""
+				}
+			} else if m.phase == "pr_error" {
+				if m.cursor == 0 {
+					// Retry
+					m.phase = "pr_generating"
+					m.apiErrorMsg = ""
+					return m, generatePRContent(m.currentBranch)
+				} else if m.cursor == 1 {
+					// Enter PR details manually
+					m.phase = "pr_manual_title"
+					m.prTitle = ""
+					m.prBody = ""
+					m.apiErrorMsg = ""
+				} else {
+					// Skip PR creation
+					m.phase = "exiting"
+					m.apiErrorMsg = ""
+					return m, tea.Quit
+				}
+			} else if m.phase == "pr_manual_title" {
+				// Move to body input
+				m.phase = "pr_manual_body"
+			} else if m.phase == "pr_manual_body" {
+				// Create the PR
+				if err := createPR(m.prTitle, m.prBody); err != nil {
+					m.errorMsg = fmt.Sprintf("Error creating PR: %v", err)
+					return m, tea.Quit
+				}
+				m.didCreatePR = true
+				m.phase = "pr_creating"
+				return m, tea.Quit
 			}
 
 		case "backspace":
@@ -300,6 +353,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.scopeInput = m.scopeInput[:len(m.scopeInput)-1]
 			} else if (m.phase == "edit" || m.phase == "manual_input") && len(m.generatedMsg) > 0 {
 				m.generatedMsg = m.generatedMsg[:len(m.generatedMsg)-1]
+			} else if m.phase == "pr_manual_title" && len(m.prTitle) > 0 {
+				m.prTitle = m.prTitle[:len(m.prTitle)-1]
+			} else if m.phase == "pr_manual_body" && len(m.prBody) > 0 {
+				m.prBody = m.prBody[:len(m.prBody)-1]
 			}
 
 		default:
@@ -312,6 +369,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.generatedMsg += "\n"
 				} else if len(msg.String()) == 1 {
 					m.generatedMsg += msg.String()
+				}
+			} else if m.phase == "pr_manual_title" {
+				if len(msg.String()) == 1 {
+					m.prTitle += msg.String()
+				}
+			} else if m.phase == "pr_manual_body" {
+				if msg.String() == "enter" {
+					m.prBody += "\n"
+				} else if len(msg.String()) == 1 {
+					m.prBody += msg.String()
 				}
 			}
 		}
@@ -355,6 +422,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case errMsg:
 		m.errorMsg = string(msg)
 		return m, tea.Quit
+
+	case commitMsgErrMsg:
+		m.apiErrorMsg = string(msg)
+		m.phase = "commit_error"
+		m.cursor = 0
+		m.choices = []string{"Retry", "Enter commit message manually"}
+
+	case prContentErrMsg:
+		m.apiErrorMsg = string(msg)
+		m.phase = "pr_error"
+		m.cursor = 0
+		m.choices = []string{"Retry", "Enter PR details manually", "Skip PR creation"}
 	}
 
 	return m, nil
@@ -553,6 +632,59 @@ func (m model) View() string {
 		return titleStyle.Render("Generating PR title and body...") + "\n"
 	}
 
+	if m.phase == "commit_error" {
+		errorStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+		s := titleStyle.Render("⚠️  API Error") + "\n\n"
+		s += errorStyle.Render("Failed to generate commit message:") + "\n"
+		s += lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(m.apiErrorMsg) + "\n\n"
+		s += titleStyle.Render("What would you like to do?") + "\n\n"
+		for i, choice := range m.choices {
+			cursor := " "
+			if m.cursor == i {
+				cursor = ">"
+				choice = selectedStyle.Render(choice)
+			}
+			s += fmt.Sprintf("%s %s\n", cursor, choice)
+		}
+		s += "\n(use arrow keys to select, enter to confirm, q to quit)\n"
+		return s
+	}
+
+	if m.phase == "pr_error" {
+		errorStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+		s := titleStyle.Render("⚠️  API Error") + "\n\n"
+		s += errorStyle.Render("Failed to generate PR content:") + "\n"
+		s += lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(m.apiErrorMsg) + "\n\n"
+		s += titleStyle.Render("What would you like to do?") + "\n\n"
+		for i, choice := range m.choices {
+			cursor := " "
+			if m.cursor == i {
+				cursor = ">"
+				choice = selectedStyle.Render(choice)
+			}
+			s += fmt.Sprintf("%s %s\n", cursor, choice)
+		}
+		s += "\n(use arrow keys to select, enter to confirm, q to quit)\n"
+		return s
+	}
+
+	if m.phase == "pr_manual_title" {
+		s := titleStyle.Render("Enter PR title:") + "\n\n"
+		s += fmt.Sprintf("> %s_\n\n", m.prTitle)
+		s += lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("Tip: Keep it concise and descriptive (max 72 chars)") + "\n"
+		s += "\n(type your title, press enter to continue to body)\n"
+		return s
+	}
+
+	if m.phase == "pr_manual_body" {
+		s := titleStyle.Render("Enter PR body:") + "\n\n"
+		s += lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Render(fmt.Sprintf("Title: %s", m.prTitle)) + "\n\n"
+		s += fmt.Sprintf("%s_\n\n", m.prBody)
+		s += lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("Tip: Describe your changes, press enter for newlines") + "\n"
+		s += "\n(type your body, press enter twice to create PR)\n"
+		return s
+	}
+
 	if m.phase == "pr_creating" {
 		summaryStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
 		return summaryStyle.Render(m.getSummary()) + "\n"
@@ -573,6 +705,8 @@ type commitMsgMsg string
 type prContentMsg string
 type errMsg string
 type branchCreatedMsg string
+type commitMsgErrMsg string // API error during commit message generation
+type prContentErrMsg string // API error during PR content generation
 
 func generateCommitMsg(diff, commitType, scope string) tea.Cmd {
 	return func() tea.Msg {
@@ -618,7 +752,7 @@ Respond with ONLY the commit message, no explanations or markdown formatting.`, 
 
 		jsonData, err := json.Marshal(reqBody)
 		if err != nil {
-			return errMsg(fmt.Sprintf("Error marshaling request: %v", err))
+			return commitMsgErrMsg(fmt.Sprintf("Error marshaling request: %v", err))
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -626,7 +760,7 @@ Respond with ONLY the commit message, no explanations or markdown formatting.`, 
 
 		req, err := http.NewRequestWithContext(ctx, "POST", anthropicURL, bytes.NewBuffer(jsonData))
 		if err != nil {
-			return errMsg(fmt.Sprintf("Error creating request: %v", err))
+			return commitMsgErrMsg(fmt.Sprintf("Error creating request: %v", err))
 		}
 
 		req.Header.Set("Content-Type", "application/json")
@@ -636,26 +770,26 @@ Respond with ONLY the commit message, no explanations or markdown formatting.`, 
 		client := &http.Client{}
 		resp, err := client.Do(req)
 		if err != nil {
-			return errMsg(fmt.Sprintf("Error making request: %v", err))
+			return commitMsgErrMsg(fmt.Sprintf("Error making request: %v", err))
 		}
 		defer resp.Body.Close()
 
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
-			return errMsg(fmt.Sprintf("Error reading response: %v", err))
+			return commitMsgErrMsg(fmt.Sprintf("Error reading response: %v", err))
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			return errMsg(fmt.Sprintf("API error (%d): %s", resp.StatusCode, string(body)))
+			return commitMsgErrMsg(fmt.Sprintf("API error (%d): %s", resp.StatusCode, string(body)))
 		}
 
 		var apiResp AnthropicResponse
 		if err := json.Unmarshal(body, &apiResp); err != nil {
-			return errMsg(fmt.Sprintf("Error parsing response: %v", err))
+			return commitMsgErrMsg(fmt.Sprintf("Error parsing response: %v", err))
 		}
 
 		if len(apiResp.Content) == 0 {
-			return errMsg("No content in API response")
+			return commitMsgErrMsg("No content in API response")
 		}
 
 		commitMsg := strings.TrimSpace(apiResp.Content[0].Text)
@@ -866,7 +1000,7 @@ func generatePRContent(branch string) tea.Cmd {
 
 		gitLog, err := getGitLog(branch)
 		if err != nil {
-			return errMsg(fmt.Sprintf("Error getting git log: %v", err))
+			return prContentErrMsg(fmt.Sprintf("Error getting git log: %v", err))
 		}
 
 		prompt := fmt.Sprintf(`You are a pull request generator. Based on the following git log from a branch, generate a clear and concise pull request title and body.
@@ -901,7 +1035,7 @@ Respond with ONLY the title and body in this format, no explanations or markdown
 
 		jsonData, err := json.Marshal(reqBody)
 		if err != nil {
-			return errMsg(fmt.Sprintf("Error marshaling request: %v", err))
+			return prContentErrMsg(fmt.Sprintf("Error marshaling request: %v", err))
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -909,7 +1043,7 @@ Respond with ONLY the title and body in this format, no explanations or markdown
 
 		req, err := http.NewRequestWithContext(ctx, "POST", anthropicURL, bytes.NewBuffer(jsonData))
 		if err != nil {
-			return errMsg(fmt.Sprintf("Error creating request: %v", err))
+			return prContentErrMsg(fmt.Sprintf("Error creating request: %v", err))
 		}
 
 		req.Header.Set("Content-Type", "application/json")
@@ -919,26 +1053,26 @@ Respond with ONLY the title and body in this format, no explanations or markdown
 		client := &http.Client{}
 		resp, err := client.Do(req)
 		if err != nil {
-			return errMsg(fmt.Sprintf("Error making request: %v", err))
+			return prContentErrMsg(fmt.Sprintf("Error making request: %v", err))
 		}
 		defer resp.Body.Close()
 
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
-			return errMsg(fmt.Sprintf("Error reading response: %v", err))
+			return prContentErrMsg(fmt.Sprintf("Error reading response: %v", err))
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			return errMsg(fmt.Sprintf("API error (%d): %s", resp.StatusCode, string(body)))
+			return prContentErrMsg(fmt.Sprintf("API error (%d): %s", resp.StatusCode, string(body)))
 		}
 
 		var apiResp AnthropicResponse
 		if err := json.Unmarshal(body, &apiResp); err != nil {
-			return errMsg(fmt.Sprintf("Error parsing response: %v", err))
+			return prContentErrMsg(fmt.Sprintf("Error parsing response: %v", err))
 		}
 
 		if len(apiResp.Content) == 0 {
-			return errMsg("No content in API response")
+			return prContentErrMsg("No content in API response")
 		}
 
 		prContent := strings.TrimSpace(apiResp.Content[0].Text)
