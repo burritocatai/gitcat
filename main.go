@@ -65,6 +65,13 @@ type model struct {
 	prBody            string
 	isProtectedBranch bool   // Track if on main/master
 	branchInput       string // User input for branch name
+
+	// Tracking completed actions for exit summary
+	filesCommitted  int
+	didCommit       bool
+	didPush         bool
+	didCreatePR     bool
+	createdBranch   string // Non-empty if a new branch was created
 }
 
 func initialModel(diff string, needsAdd bool, currentBranch string, isProtectedBranch bool) model {
@@ -205,10 +212,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			} else if m.phase == "confirm" {
 				if m.cursor == 0 {
+					m.filesCommitted = countStagedFiles()
 					if err := gitCommit(m.generatedMsg); err != nil {
 						m.errorMsg = fmt.Sprintf("Error committing: %v", err)
 						return m, tea.Quit
 					}
+					m.didCommit = true
 					m.phase = "push_prompt"
 					m.cursor = 1
 					m.choices = []string{"Yes, push", "No, skip"}
@@ -216,10 +225,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.phase = "edit"
 				}
 			} else if m.phase == "edit" || m.phase == "manual_input" {
+				m.filesCommitted = countStagedFiles()
 				if err := gitCommit(m.generatedMsg); err != nil {
 					m.errorMsg = fmt.Sprintf("Error committing: %v", err)
 					return m, tea.Quit
 				}
+				m.didCommit = true
 				m.phase = "push_prompt"
 				m.cursor = 1
 				m.choices = []string{"Yes, push", "No, skip"}
@@ -237,11 +248,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.errorMsg = fmt.Sprintf("Error pushing: %v", err)
 						return m, tea.Quit
 					}
+					m.didPush = true
 					// Check if PR already exists or if origin is not GitHub
 					if err := isGitHubOrigin(); err != nil {
+						m.phase = "exiting"
 						return m, tea.Quit
 					}
 					if hasExistingPR(m.currentBranch) {
+						m.phase = "exiting"
 						return m, tea.Quit
 					}
 					m.phase = "pr_prompt"
@@ -249,6 +263,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.choices = []string{"Yes, create PR", "No, skip"}
 					return m, nil
 				}
+				m.phase = "exiting"
 				return m, tea.Quit
 			} else if m.phase == "upstream_prompt" {
 				if m.cursor == 0 {
@@ -256,8 +271,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.errorMsg = fmt.Sprintf("Error setting upstream: %v", err)
 						return m, tea.Quit
 					}
+					m.didPush = true
 					// Check if PR already exists (GitHub origin already verified earlier)
 					if hasExistingPR(m.currentBranch) {
+						m.phase = "exiting"
 						return m, tea.Quit
 					}
 					m.phase = "pr_prompt"
@@ -265,12 +282,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.choices = []string{"Yes, create PR", "No, skip"}
 					return m, nil
 				}
+				m.phase = "exiting"
 				return m, tea.Quit
 			} else if m.phase == "pr_prompt" {
 				if m.cursor == 0 {
 					m.phase = "pr_generating"
 					return m, generatePRContent(m.currentBranch)
 				}
+				m.phase = "exiting"
 				return m, tea.Quit
 			}
 
@@ -316,11 +335,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.errorMsg = fmt.Sprintf("Error creating PR: %v", err)
 			return m, tea.Quit
 		}
+		m.didCreatePR = true
 		m.phase = "pr_creating"
 		return m, tea.Quit
 
 	case branchCreatedMsg:
 		// Branch created successfully, update current branch name
+		m.createdBranch = string(msg)
 		m.currentBranch = string(msg)
 		// Continue to normal flow
 		if m.needsAdd {
@@ -337,6 +358,40 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+func (m model) getSummary() string {
+	if !m.didCommit {
+		return ""
+	}
+
+	var parts []string
+
+	// Files committed
+	fileWord := "file"
+	if m.filesCommitted != 1 {
+		fileWord = "files"
+	}
+	parts = append(parts, fmt.Sprintf("Committed %d %s", m.filesCommitted, fileWord))
+
+	// Branch info
+	if m.createdBranch != "" {
+		parts = append(parts, fmt.Sprintf("to new branch %s", m.createdBranch))
+	} else {
+		parts = append(parts, fmt.Sprintf("to branch %s", m.currentBranch))
+	}
+
+	// Push info
+	if m.didPush {
+		parts = append(parts, "and pushed")
+	}
+
+	// PR info
+	if m.didCreatePR {
+		parts = append(parts, "and created PR")
+	}
+
+	return strings.Join(parts, " ")
 }
 
 func (m model) View() string {
@@ -499,13 +554,16 @@ func (m model) View() string {
 	}
 
 	if m.phase == "pr_creating" {
-		s := titleStyle.Render("✓ Pull request created successfully!") + "\n\n"
-		s += fmt.Sprintf("Title: %s\n", m.prTitle)
-		return s
+		summaryStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
+		return summaryStyle.Render(m.getSummary()) + "\n"
 	}
 
-	if m.phase == "done" {
-		return titleStyle.Render("✓ Done!") + "\n"
+	if m.phase == "done" || m.phase == "exiting" {
+		if summary := m.getSummary(); summary != "" {
+			summaryStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
+			return summaryStyle.Render(summary) + "\n"
+		}
+		return ""
 	}
 
 	return ""
@@ -626,6 +684,19 @@ func getGitStatus() (bool, error) {
 		return false, fmt.Errorf("git status failed: %w", err)
 	}
 	return len(output) > 0, nil
+}
+
+func countStagedFiles() int {
+	cmd := exec.Command("git", "diff", "--staged", "--name-only")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return 0
+	}
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) == 1 && lines[0] == "" {
+		return 0
+	}
+	return len(lines)
 }
 
 func gitAdd() error {
