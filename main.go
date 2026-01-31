@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -18,14 +19,27 @@ import (
 )
 
 const (
-	defaultModel       = "claude-sonnet-4-5-20250929"
-	anthropicURL       = "https://api.anthropic.com/v1/messages"
-	diffLineSizeLimit  = 1000 // Skip AI generation for diffs larger than this
+	defaultAnthropicModel = "claude-sonnet-4-5-20250929"
+	defaultOllamaModel    = "llama3.2"
+	defaultOllamaURL      = "http://localhost:11434"
+	anthropicURL          = "https://api.anthropic.com/v1/messages"
+	diffLineSizeLimit     = 1000 // Skip AI generation for diffs larger than this
 )
 
+// Config represents the application configuration
+type Config struct {
+	Provider  string `json:"provider"`   // "anthropic" or "ollama"
+	Model     string `json:"model"`      // Model name
+	OllamaURL string `json:"ollama_url"` // Ollama server URL
+}
+
 var (
-	modelFlag = flag.String("model", defaultModel, "Anthropic model to use")
-	mFlag     = flag.String("m", "", "Anthropic model to use (shorthand)")
+	modelFlag    = flag.String("model", "", "Model to use (overrides config)")
+	mFlag        = flag.String("m", "", "Model to use (shorthand, overrides config)")
+	providerFlag = flag.String("provider", "", "LLM provider: anthropic or ollama (overrides config)")
+	pFlag        = flag.String("p", "", "LLM provider (shorthand, overrides config)")
+	ollamaURLFlag = flag.String("ollama-url", "", "Ollama server URL (overrides config)")
+	appConfig    *Config
 )
 
 type AnthropicRequest struct {
@@ -46,6 +60,130 @@ type AnthropicResponse struct {
 type ContentBlock struct {
 	Type string `json:"type"`
 	Text string `json:"text"`
+}
+
+// Ollama API types
+type OllamaRequest struct {
+	Model    string          `json:"model"`
+	Messages []OllamaMessage `json:"messages"`
+	Stream   bool            `json:"stream"`
+}
+
+type OllamaMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type OllamaResponse struct {
+	Model   string        `json:"model"`
+	Message OllamaMessage `json:"message"`
+}
+
+// getConfigPath returns the path to the config file
+func getConfigPath() (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to get home directory: %w", err)
+	}
+	return filepath.Join(homeDir, ".config", "gitcat", "config.json"), nil
+}
+
+// loadConfig loads the configuration from the config file
+func loadConfig() (*Config, error) {
+	configPath, err := getConfigPath()
+	if err != nil {
+		return nil, err
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Return default config if file doesn't exist
+			return &Config{
+				Provider:  "anthropic",
+				Model:     defaultAnthropicModel,
+				OllamaURL: defaultOllamaURL,
+			}, nil
+		}
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	var config Config
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	// Set defaults for missing values
+	if config.Provider == "" {
+		config.Provider = "anthropic"
+	}
+	if config.Model == "" {
+		if config.Provider == "ollama" {
+			config.Model = defaultOllamaModel
+		} else {
+			config.Model = defaultAnthropicModel
+		}
+	}
+	if config.OllamaURL == "" {
+		config.OllamaURL = defaultOllamaURL
+	}
+
+	return &config, nil
+}
+
+// saveConfig saves the configuration to the config file
+func saveConfig(config *Config) error {
+	configPath, err := getConfigPath()
+	if err != nil {
+		return err
+	}
+
+	// Ensure directory exists
+	configDir := filepath.Dir(configPath)
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		return fmt.Errorf("failed to create config directory: %w", err)
+	}
+
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+
+	if err := os.WriteFile(configPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write config file: %w", err)
+	}
+
+	return nil
+}
+
+// getEffectiveConfig returns the config with CLI flag overrides applied
+func getEffectiveConfig() *Config {
+	config := *appConfig // Copy the config
+
+	// Apply provider override
+	provider := *providerFlag
+	if *pFlag != "" {
+		provider = *pFlag
+	}
+	if provider != "" {
+		config.Provider = provider
+	}
+
+	// Apply model override
+	model := *modelFlag
+	if *mFlag != "" {
+		model = *mFlag
+	}
+	if model != "" {
+		config.Model = model
+	}
+
+	// Apply Ollama URL override
+	if *ollamaURLFlag != "" {
+		config.OllamaURL = *ollamaURLFlag
+	}
+
+	return &config
 }
 
 type model struct {
@@ -710,15 +848,7 @@ type prContentErrMsg string // API error during PR content generation
 
 func generateCommitMsg(diff, commitType, scope string) tea.Cmd {
 	return func() tea.Msg {
-		apiKey := os.Getenv("ANTHROPIC_API_KEY")
-		if apiKey == "" {
-			return errMsg("ANTHROPIC_API_KEY environment variable not set")
-		}
-
-		model := *modelFlag
-		if *mFlag != "" {
-			model = *mFlag
-		}
+		config := getEffectiveConfig()
 
 		prompt := fmt.Sprintf(`You are a commit message generator. Based on the following git diff, generate a concise commit message using conventional commits format.
 
@@ -739,62 +869,184 @@ Git diff:
 
 Respond with ONLY the commit message, no explanations or markdown formatting.`, commitType, scope, commitType, scope, diff)
 
-		reqBody := AnthropicRequest{
-			Model:     model,
-			MaxTokens: 1024,
-			Messages: []Message{
-				{
-					Role:    "user",
-					Content: prompt,
-				},
-			},
+		if config.Provider == "ollama" {
+			return generateWithOllama(config, prompt, 1024, false)
 		}
-
-		jsonData, err := json.Marshal(reqBody)
-		if err != nil {
-			return commitMsgErrMsg(fmt.Sprintf("Error marshaling request: %v", err))
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-
-		req, err := http.NewRequestWithContext(ctx, "POST", anthropicURL, bytes.NewBuffer(jsonData))
-		if err != nil {
-			return commitMsgErrMsg(fmt.Sprintf("Error creating request: %v", err))
-		}
-
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("x-api-key", apiKey)
-		req.Header.Set("anthropic-version", "2023-06-01")
-
-		client := &http.Client{}
-		resp, err := client.Do(req)
-		if err != nil {
-			return commitMsgErrMsg(fmt.Sprintf("Error making request: %v", err))
-		}
-		defer resp.Body.Close()
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return commitMsgErrMsg(fmt.Sprintf("Error reading response: %v", err))
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			return commitMsgErrMsg(fmt.Sprintf("API error (%d): %s", resp.StatusCode, string(body)))
-		}
-
-		var apiResp AnthropicResponse
-		if err := json.Unmarshal(body, &apiResp); err != nil {
-			return commitMsgErrMsg(fmt.Sprintf("Error parsing response: %v", err))
-		}
-
-		if len(apiResp.Content) == 0 {
-			return commitMsgErrMsg("No content in API response")
-		}
-
-		commitMsg := strings.TrimSpace(apiResp.Content[0].Text)
-		return commitMsgMsg(commitMsg)
+		return generateWithAnthropic(config, prompt, 1024, false)
 	}
+}
+
+// generateWithAnthropic sends a request to the Anthropic API
+func generateWithAnthropic(config *Config, prompt string, maxTokens int, isPR bool) tea.Msg {
+	apiKey := os.Getenv("ANTHROPIC_API_KEY")
+	if apiKey == "" {
+		if isPR {
+			return prContentErrMsg("ANTHROPIC_API_KEY environment variable not set")
+		}
+		return commitMsgErrMsg("ANTHROPIC_API_KEY environment variable not set")
+	}
+
+	reqBody := AnthropicRequest{
+		Model:     config.Model,
+		MaxTokens: maxTokens,
+		Messages: []Message{
+			{
+				Role:    "user",
+				Content: prompt,
+			},
+		},
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		if isPR {
+			return prContentErrMsg(fmt.Sprintf("Error marshaling request: %v", err))
+		}
+		return commitMsgErrMsg(fmt.Sprintf("Error marshaling request: %v", err))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", anthropicURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		if isPR {
+			return prContentErrMsg(fmt.Sprintf("Error creating request: %v", err))
+		}
+		return commitMsgErrMsg(fmt.Sprintf("Error creating request: %v", err))
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		if isPR {
+			return prContentErrMsg(fmt.Sprintf("Error making request: %v", err))
+		}
+		return commitMsgErrMsg(fmt.Sprintf("Error making request: %v", err))
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		if isPR {
+			return prContentErrMsg(fmt.Sprintf("Error reading response: %v", err))
+		}
+		return commitMsgErrMsg(fmt.Sprintf("Error reading response: %v", err))
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		if isPR {
+			return prContentErrMsg(fmt.Sprintf("API error (%d): %s", resp.StatusCode, string(body)))
+		}
+		return commitMsgErrMsg(fmt.Sprintf("API error (%d): %s", resp.StatusCode, string(body)))
+	}
+
+	var apiResp AnthropicResponse
+	if err := json.Unmarshal(body, &apiResp); err != nil {
+		if isPR {
+			return prContentErrMsg(fmt.Sprintf("Error parsing response: %v", err))
+		}
+		return commitMsgErrMsg(fmt.Sprintf("Error parsing response: %v", err))
+	}
+
+	if len(apiResp.Content) == 0 {
+		if isPR {
+			return prContentErrMsg("No content in API response")
+		}
+		return commitMsgErrMsg("No content in API response")
+	}
+
+	result := strings.TrimSpace(apiResp.Content[0].Text)
+	if isPR {
+		return prContentMsg(result)
+	}
+	return commitMsgMsg(result)
+}
+
+// generateWithOllama sends a request to the Ollama API
+func generateWithOllama(config *Config, prompt string, _ int, isPR bool) tea.Msg {
+	reqBody := OllamaRequest{
+		Model: config.Model,
+		Messages: []OllamaMessage{
+			{
+				Role:    "user",
+				Content: prompt,
+			},
+		},
+		Stream: false,
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		if isPR {
+			return prContentErrMsg(fmt.Sprintf("Error marshaling request: %v", err))
+		}
+		return commitMsgErrMsg(fmt.Sprintf("Error marshaling request: %v", err))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second) // Longer timeout for local models
+	defer cancel()
+
+	ollamaEndpoint := config.OllamaURL + "/api/chat"
+	req, err := http.NewRequestWithContext(ctx, "POST", ollamaEndpoint, bytes.NewBuffer(jsonData))
+	if err != nil {
+		if isPR {
+			return prContentErrMsg(fmt.Sprintf("Error creating request: %v", err))
+		}
+		return commitMsgErrMsg(fmt.Sprintf("Error creating request: %v", err))
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		if isPR {
+			return prContentErrMsg(fmt.Sprintf("Error making request to Ollama (%s): %v", ollamaEndpoint, err))
+		}
+		return commitMsgErrMsg(fmt.Sprintf("Error making request to Ollama (%s): %v", ollamaEndpoint, err))
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		if isPR {
+			return prContentErrMsg(fmt.Sprintf("Error reading response: %v", err))
+		}
+		return commitMsgErrMsg(fmt.Sprintf("Error reading response: %v", err))
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		if isPR {
+			return prContentErrMsg(fmt.Sprintf("Ollama API error (%d): %s", resp.StatusCode, string(body)))
+		}
+		return commitMsgErrMsg(fmt.Sprintf("Ollama API error (%d): %s", resp.StatusCode, string(body)))
+	}
+
+	var apiResp OllamaResponse
+	if err := json.Unmarshal(body, &apiResp); err != nil {
+		if isPR {
+			return prContentErrMsg(fmt.Sprintf("Error parsing response: %v", err))
+		}
+		return commitMsgErrMsg(fmt.Sprintf("Error parsing response: %v", err))
+	}
+
+	result := strings.TrimSpace(apiResp.Message.Content)
+	if result == "" {
+		if isPR {
+			return prContentErrMsg("No content in Ollama API response")
+		}
+		return commitMsgErrMsg("No content in Ollama API response")
+	}
+
+	if isPR {
+		return prContentMsg(result)
+	}
+	return commitMsgMsg(result)
 }
 
 func getGitDiff() (string, error) {
@@ -988,15 +1240,7 @@ func getGitLog(branch string) (string, error) {
 
 func generatePRContent(branch string) tea.Cmd {
 	return func() tea.Msg {
-		apiKey := os.Getenv("ANTHROPIC_API_KEY")
-		if apiKey == "" {
-			return errMsg("ANTHROPIC_API_KEY environment variable not set")
-		}
-
-		model := *modelFlag
-		if *mFlag != "" {
-			model = *mFlag
-		}
+		config := getEffectiveConfig()
 
 		gitLog, err := getGitLog(branch)
 		if err != nil {
@@ -1022,61 +1266,10 @@ Format your response as:
 
 Respond with ONLY the title and body in this format, no explanations or markdown code blocks.`, gitLog)
 
-		reqBody := AnthropicRequest{
-			Model:     model,
-			MaxTokens: 2048,
-			Messages: []Message{
-				{
-					Role:    "user",
-					Content: prompt,
-				},
-			},
+		if config.Provider == "ollama" {
+			return generateWithOllama(config, prompt, 2048, true)
 		}
-
-		jsonData, err := json.Marshal(reqBody)
-		if err != nil {
-			return prContentErrMsg(fmt.Sprintf("Error marshaling request: %v", err))
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-
-		req, err := http.NewRequestWithContext(ctx, "POST", anthropicURL, bytes.NewBuffer(jsonData))
-		if err != nil {
-			return prContentErrMsg(fmt.Sprintf("Error creating request: %v", err))
-		}
-
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("x-api-key", apiKey)
-		req.Header.Set("anthropic-version", "2023-06-01")
-
-		client := &http.Client{}
-		resp, err := client.Do(req)
-		if err != nil {
-			return prContentErrMsg(fmt.Sprintf("Error making request: %v", err))
-		}
-		defer resp.Body.Close()
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return prContentErrMsg(fmt.Sprintf("Error reading response: %v", err))
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			return prContentErrMsg(fmt.Sprintf("API error (%d): %s", resp.StatusCode, string(body)))
-		}
-
-		var apiResp AnthropicResponse
-		if err := json.Unmarshal(body, &apiResp); err != nil {
-			return prContentErrMsg(fmt.Sprintf("Error parsing response: %v", err))
-		}
-
-		if len(apiResp.Content) == 0 {
-			return prContentErrMsg("No content in API response")
-		}
-
-		prContent := strings.TrimSpace(apiResp.Content[0].Text)
-		return prContentMsg(prContent)
+		return generateWithAnthropic(config, prompt, 2048, true)
 	}
 }
 
@@ -1091,6 +1284,23 @@ func createPR(title, body string) error {
 
 func main() {
 	flag.Parse()
+
+	// Load configuration
+	var err error
+	appConfig, err = loadConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Save config if it doesn't exist (creates default config file)
+	configPath, _ := getConfigPath()
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		if err := saveConfig(appConfig); err != nil {
+			// Non-fatal: just warn if we can't save the default config
+			fmt.Fprintf(os.Stderr, "Warning: could not save default config: %v\n", err)
+		}
+	}
 
 	diff, err := getGitDiff()
 	if err != nil {
