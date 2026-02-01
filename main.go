@@ -1282,8 +1282,296 @@ func createPR(title, body string) error {
 	return nil
 }
 
+// Config TUI model for endpoint configuration
+type configModel struct {
+	phase      string // "provider", "anthropic_model", "ollama_model", "ollama_url", "confirm", "saved", "error"
+	provider   string
+	model      string
+	ollamaURL  string
+	input      string // Current input value
+	errorMsg   string
+	configPath string
+}
+
+const (
+	phaseProvider       = "provider"
+	phaseAnthropicModel = "anthropic_model"
+	phaseOllamaModel    = "ollama_model"
+	phaseOllamaURL      = "ollama_url"
+	phaseConfirm        = "confirm"
+	phaseSaved          = "saved"
+	phaseError          = "error"
+)
+
+func initialConfigModel(config *Config, configPath string) configModel {
+	return configModel{
+		phase:      phaseProvider,
+		provider:   config.Provider,
+		model:      config.Model,
+		ollamaURL:  config.OllamaURL,
+		configPath: configPath,
+	}
+}
+
+func (m configModel) Init() tea.Cmd {
+	return nil
+}
+
+func (m configModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c", "q":
+			return m, tea.Quit
+
+		case "1":
+			if m.phase == phaseProvider {
+				m.provider = "anthropic"
+			}
+		case "2":
+			if m.phase == phaseProvider {
+				m.provider = "ollama"
+			}
+
+		case "enter":
+			switch m.phase {
+			case phaseProvider:
+				m.phase = phaseAnthropicModel
+				m.input = m.model
+			case phaseAnthropicModel:
+				if m.input != "" {
+					m.model = m.input
+				}
+				if m.provider == "ollama" {
+					m.phase = phaseOllamaModel
+					m.input = m.model
+				} else {
+					m.phase = phaseConfirm
+				}
+			case phaseOllamaModel:
+				if m.input != "" {
+					m.model = m.input
+				}
+				m.phase = phaseOllamaURL
+				m.input = m.ollamaURL
+			case phaseOllamaURL:
+				if m.input != "" {
+					m.ollamaURL = m.input
+				}
+				m.phase = phaseConfirm
+			case phaseConfirm:
+				// Save the config
+				newConfig := &Config{
+					Provider:  m.provider,
+					Model:     m.model,
+					OllamaURL: m.ollamaURL,
+				}
+				if err := saveConfig(newConfig); err != nil {
+					m.errorMsg = err.Error()
+					m.phase = phaseError
+				} else {
+					m.phase = phaseSaved
+					return m, tea.Quit
+				}
+			case phaseError:
+				return m, tea.Quit
+			case phaseSaved:
+				return m, tea.Quit
+			}
+
+		case "y":
+			if m.phase == phaseConfirm {
+				// Save the config
+				newConfig := &Config{
+					Provider:  m.provider,
+					Model:     m.model,
+					OllamaURL: m.ollamaURL,
+				}
+				if err := saveConfig(newConfig); err != nil {
+					m.errorMsg = err.Error()
+					m.phase = phaseError
+				} else {
+					m.phase = phaseSaved
+					return m, tea.Quit
+				}
+			}
+		case "n":
+			if m.phase == phaseConfirm {
+				return m, tea.Quit
+			}
+
+		case "backspace":
+			if len(m.input) > 0 {
+				m.input = m.input[:len(m.input)-1]
+			}
+
+		default:
+			if len(msg.String()) == 1 && m.phase != phaseProvider && m.phase != phaseConfirm && m.phase != phaseSaved && m.phase != phaseError {
+				m.input += msg.String()
+			}
+		}
+
+	case tea.WindowSizeMsg:
+		// Handle window resize if needed
+	}
+
+	return m, nil
+}
+
+func (m configModel) View() string {
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
+	selectedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
+	errorStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	labelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
+
+	if m.phase == phaseError {
+		s := titleStyle.Render("Error saving configuration") + "\n\n"
+		s += errorStyle.Render(m.errorMsg) + "\n\n"
+		s += "Press enter to exit or q to quit\n"
+		return s
+	}
+
+	if m.phase == phaseSaved {
+		successStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
+		s := successStyle.Render("✓ Configuration saved successfully!") + "\n\n"
+		s += labelStyle.Render("Provider:") + " " + m.provider + "\n"
+		s += labelStyle.Render("Model:") + " " + m.model + "\n"
+		if m.provider == "ollama" {
+			s += labelStyle.Render("Ollama URL:") + " " + m.ollamaURL + "\n"
+		}
+		s += "\n" + labelStyle.Render("Config file:") + " " + m.configPath + "\n\n"
+		s += "Press enter to exit\n"
+		return s
+	}
+
+	if m.phase == phaseProvider {
+		s := titleStyle.Render("Select LLM Provider") + "\n\n"
+		providers := []string{"anthropic", "ollama"}
+		for _, p := range providers {
+			prefix := " "
+			if m.provider == p {
+				prefix = ">"
+				p = selectedStyle.Render(p)
+			}
+			s += fmt.Sprintf("%s %s\n", prefix, p)
+		}
+		s += "\n(press 1 for anthropic, 2 for ollama, enter to continue)\n"
+		return s
+	}
+
+	if m.phase == phaseAnthropicModel {
+		s := titleStyle.Render("Configure Anthropic Model") + "\n\n"
+		s += labelStyle.Render("Provider:") + " anthropic\n\n"
+		s += "Enter model name:\n"
+		s += fmt.Sprintf("> %s_\n", m.input)
+		s += "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("Default: "+defaultAnthropicModel) + "\n"
+		s += "(press enter when done)\n"
+		return s
+	}
+
+	if m.phase == phaseOllamaModel {
+		s := titleStyle.Render("Configure Ollama Model") + "\n\n"
+		s += labelStyle.Render("Provider:") + " ollama\n\n"
+		s += "Enter model name:\n"
+		s += fmt.Sprintf("> %s_\n", m.input)
+		s += "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("Default: "+defaultOllamaModel) + "\n"
+		s += "(press enter when done)\n"
+		return s
+	}
+
+	if m.phase == phaseOllamaURL {
+		s := titleStyle.Render("Configure Ollama Server URL") + "\n\n"
+		s += labelStyle.Render("Provider:") + " ollama\n"
+		s += labelStyle.Render("Model:") + " " + m.model + "\n\n"
+		s += "Enter Ollama server URL:\n"
+		s += fmt.Sprintf("> %s_\n", m.input)
+		s += "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("Default: "+defaultOllamaURL) + "\n"
+		s += "(press enter when done)\n"
+		return s
+	}
+
+	if m.phase == phaseConfirm {
+		s := titleStyle.Render("Confirm Configuration") + "\n\n"
+		s += labelStyle.Render("Provider:") + " " + m.provider + "\n"
+		s += labelStyle.Render("Model:") + " " + m.model + "\n"
+		if m.provider == "ollama" {
+			s += labelStyle.Render("Ollama URL:") + " " + m.ollamaURL + "\n"
+		}
+		s += "\n" + labelStyle.Render("Config file:") + " " + m.configPath + "\n\n"
+		s += titleStyle.Render("Save this configuration?") + "\n\n"
+		s += "  [y] Yes, save\n"
+		s += "  [n] No, cancel\n\n"
+		s += "(press y to save, n to cancel, q to quit)\n"
+		return s
+	}
+
+	return ""
+}
+
+func runConfigUI() {
+	// Load current config
+	config, err := loadConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
+		os.Exit(1)
+	}
+
+	configPath, err := getConfigPath()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error getting config path: %v\n", err)
+		os.Exit(1)
+	}
+
+	p := tea.NewProgram(initialConfigModel(config, configPath))
+	if _, err := p.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error running config UI: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func printHelp() {
+	fmt.Println(`gitcat - AI-powered git commit message generator
+
+USAGE:
+    gitcat [OPTIONS]
+
+OPTIONS:
+    -m, --model <model>           Model to use (overrides config)
+    -p, --provider <provider>     LLM provider: anthropic or ollama (overrides config)
+    --ollama-url <url>            Ollama server URL (overrides config)
+
+SUBCOMMANDS:
+    config                        Open configuration TUI to set provider, model, and endpoints
+    help                          Show this help message
+
+EXAMPLES:
+    gitcat                        Generate a commit message with default config
+    gitcat -m claude-3-opus       Use a specific model
+    gitcat -p ollama              Use Ollama provider
+    gitcat config                 Configure endpoints and settings
+
+CONFIGURATION:
+    Config is stored in: ~/.config/gitcat/config.json
+    Available providers:
+      - anthropic: Requires ANTHROPIC_API_KEY environment variable
+      - ollama: Local Ollama instance for running open-source models`)
+}
+
 func main() {
 	flag.Parse()
+
+	// Handle subcommands
+	if len(flag.Args()) > 0 {
+		switch flag.Arg(0) {
+		case "config":
+			// Run the configuration TUI and exit
+			runConfigUI()
+			return
+		case "help", "-h", "--help":
+			printHelp()
+			return
+		}
+	}
 
 	// Load configuration
 	var err error
