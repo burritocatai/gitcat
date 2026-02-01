@@ -4,7 +4,7 @@ A Go CLI tool that generates conventional commit messages using Anthropic's Clau
 
 ## Features
 
-- 🤖 AI-powered commit message generation using Claude models
+- 🤖 AI-powered commit message generation using Claude models or Ollama
 - 📝 Conventional Commits format (feat, fix, docs, etc.)
 - 🎨 Interactive terminal UI with dropdown selections
 - 🔐 Secure API key management via environment variables (1Password compatible)
