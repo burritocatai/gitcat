@@ -186,6 +186,12 @@ func getEffectiveConfig() *Config {
 	return &config
 }
 
+// Spinner frames for loading animation
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+// tickMsg is sent periodically to animate the spinner
+type tickMsg time.Time
+
 type model struct {
 	choices           []string
 	cursor            int
@@ -203,6 +209,9 @@ type model struct {
 	prBody            string
 	isProtectedBranch bool   // Track if on main/master
 	branchInput       string // User input for branch name
+
+	// Spinner state
+	spinnerIndex int
 
 	// Tracking completed actions for exit summary
 	filesCommitted  int
@@ -242,6 +251,12 @@ func initialModel(diff string, needsAdd bool, currentBranch string, isProtectedB
 	}
 }
 
+func tickCmd() tea.Cmd {
+	return tea.Tick(80*time.Millisecond, func(t time.Time) tea.Msg {
+		return tickMsg(t)
+	})
+}
+
 func (m model) Init() tea.Cmd {
 	return nil
 }
@@ -262,6 +277,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.cursor--
 				} else if m.phase == "type" && m.typeSelected > 0 {
 					m.typeSelected--
+				} else if m.phase == "model_select" && m.cursor > 0 {
+					m.cursor--
+				} else if m.phase == "pr_preview" && m.cursor > 0 {
+					m.cursor--
 				} else if (m.phase == "push_prompt" || m.phase == "upstream_prompt" || m.phase == "pr_prompt" || m.phase == "confirm" || m.phase == "commit_error" || m.phase == "pr_error") && m.cursor > 0 {
 					m.cursor--
 				}
@@ -289,6 +308,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.cursor++
 				} else if m.phase == "type" && m.typeSelected < len(m.commitTypes)-1 {
 					m.typeSelected++
+				} else if m.phase == "model_select" {
+					models := getAvailableModels()
+					if m.cursor < len(models)-1 {
+						m.cursor++
+					}
+				} else if m.phase == "pr_preview" && m.cursor < len(m.choices)-1 {
+					m.cursor++
 				} else if (m.phase == "push_prompt" || m.phase == "upstream_prompt" || m.phase == "pr_prompt" || m.phase == "confirm" || m.phase == "commit_error" || m.phase == "pr_error") && m.cursor < len(m.choices)-1 {
 					m.cursor++
 				}
@@ -357,7 +383,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.generatedMsg = "" // Start with empty message for manual input
 				} else {
 					m.phase = "generating"
-					return m, generateCommitMsg(m.diff, m.commitTypes[m.typeSelected], m.scopeInput)
+					m.spinnerIndex = 0
+					return m, tea.Batch(generateCommitMsg(m.diff, m.commitTypes[m.typeSelected], m.scopeInput), tickCmd())
 				}
 			} else if m.phase == "confirm" {
 				if m.cursor == 0 {
@@ -370,9 +397,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.phase = "push_prompt"
 					m.cursor = 1
 					m.choices = []string{"Yes, push", "No, skip"}
+				} else if m.cursor == 2 {
+					// Try different model
+					m.phase = "model_select"
+					m.cursor = 0
 				} else {
 					m.phase = "edit"
 				}
+			} else if m.phase == "model_select" {
+				// User selected a model, regenerate
+				models := getAvailableModels()
+				if m.cursor >= 0 && m.cursor < len(models) {
+					*mFlag = models[m.cursor]
+				}
+				m.phase = "generating"
+				m.spinnerIndex = 0
+				return m, tea.Batch(generateCommitMsg(m.diff, m.commitTypes[m.typeSelected], m.scopeInput), tickCmd())
 			} else if m.phase == "edit" || m.phase == "manual_input" {
 				m.filesCommitted = countStagedFiles()
 				if err := gitCommit(m.generatedMsg); err != nil {
@@ -436,7 +476,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else if m.phase == "pr_prompt" {
 				if m.cursor == 0 {
 					m.phase = "pr_generating"
-					return m, generatePRContent(m.currentBranch)
+					m.spinnerIndex = 0
+					return m, tea.Batch(generatePRContent(m.currentBranch), tickCmd())
 				}
 				m.phase = "exiting"
 				return m, tea.Quit
@@ -444,8 +485,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.cursor == 0 {
 					// Retry
 					m.phase = "generating"
+					m.spinnerIndex = 0
 					m.apiErrorMsg = ""
-					return m, generateCommitMsg(m.diff, m.commitTypes[m.typeSelected], m.scopeInput)
+					return m, tea.Batch(generateCommitMsg(m.diff, m.commitTypes[m.typeSelected], m.scopeInput), tickCmd())
 				} else {
 					// Enter commit message manually
 					m.phase = "manual_input"
@@ -456,8 +498,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.cursor == 0 {
 					// Retry
 					m.phase = "pr_generating"
+					m.spinnerIndex = 0
 					m.apiErrorMsg = ""
-					return m, generatePRContent(m.currentBranch)
+					return m, tea.Batch(generatePRContent(m.currentBranch), tickCmd())
 				} else if m.cursor == 1 {
 					// Enter PR details manually
 					m.phase = "pr_manual_title"
@@ -468,6 +511,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// Skip PR creation
 					m.phase = "exiting"
 					m.apiErrorMsg = ""
+					return m, tea.Quit
+				}
+			} else if m.phase == "pr_preview" {
+				if m.cursor == 0 {
+					// Create the PR
+					if err := createPR(m.prTitle, m.prBody); err != nil {
+						m.errorMsg = fmt.Sprintf("Error creating PR: %v", err)
+						return m, tea.Quit
+					}
+					m.didCreatePR = true
+					m.phase = "pr_creating"
+					return m, tea.Quit
+				} else if m.cursor == 1 {
+					// Edit - go to manual title editing with current values
+					m.phase = "pr_manual_title"
+				} else {
+					// Cancel
+					m.phase = "exiting"
 					return m, tea.Quit
 				}
 			} else if m.phase == "pr_manual_title" {
@@ -521,11 +582,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case tickMsg:
+		if m.phase == "generating" || m.phase == "pr_generating" {
+			m.spinnerIndex = (m.spinnerIndex + 1) % len(spinnerFrames)
+			return m, tickCmd()
+		}
+
 	case commitMsgMsg:
 		m.generatedMsg = string(msg)
 		m.phase = "confirm"
 		m.cursor = 0
-		m.choices = []string{"Yes, commit", "No, let me edit"}
+		m.choices = []string{"Yes, commit", "No, let me edit", "Try different model"}
 
 	case prContentMsg:
 		parts := strings.SplitN(string(msg), "\n---BODY---\n", 2)
@@ -536,13 +603,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.prTitle = string(msg)
 			m.prBody = ""
 		}
-		if err := createPR(m.prTitle, m.prBody); err != nil {
-			m.errorMsg = fmt.Sprintf("Error creating PR: %v", err)
-			return m, tea.Quit
-		}
-		m.didCreatePR = true
-		m.phase = "pr_creating"
-		return m, tea.Quit
+		m.phase = "pr_preview"
+		m.cursor = 0
+		m.choices = []string{"Yes, create PR", "Edit title and body", "Cancel"}
 
 	case branchCreatedMsg:
 		// Branch created successfully, update current branch name
@@ -686,7 +749,8 @@ func (m model) View() string {
 	}
 
 	if m.phase == "generating" {
-		return titleStyle.Render("Generating commit message...") + "\n"
+		spinner := lipgloss.NewStyle().Foreground(lipgloss.Color("12")).Render(spinnerFrames[m.spinnerIndex])
+		return spinner + " " + titleStyle.Render("Generating commit message...") + "\n"
 	}
 
 	if m.phase == "confirm" {
@@ -702,6 +766,27 @@ func (m model) View() string {
 			s += fmt.Sprintf("%s %s\n", cursor, choice)
 		}
 		s += "\n(use arrow keys to select, enter to confirm, q to quit)\n"
+		return s
+	}
+
+	if m.phase == "model_select" {
+		config := getEffectiveConfig()
+		s := titleStyle.Render("Select a model to regenerate:") + "\n\n"
+		s += lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(fmt.Sprintf("Current provider: %s", config.Provider)) + "\n\n"
+		models := getAvailableModels()
+		for i, model := range models {
+			cursor := " "
+			label := model
+			if model == config.Model {
+				label = model + " (current)"
+			}
+			if m.cursor == i {
+				cursor = ">"
+				label = selectedStyle.Render(label)
+			}
+			s += fmt.Sprintf("%s %s\n", cursor, label)
+		}
+		s += "\n(use arrow keys to select, enter to regenerate, q to quit)\n"
 		return s
 	}
 
@@ -767,7 +852,27 @@ func (m model) View() string {
 	}
 
 	if m.phase == "pr_generating" {
-		return titleStyle.Render("Generating PR title and body...") + "\n"
+		spinner := lipgloss.NewStyle().Foreground(lipgloss.Color("12")).Render(spinnerFrames[m.spinnerIndex])
+		return spinner + " " + titleStyle.Render("Generating PR title and body...") + "\n"
+	}
+
+	if m.phase == "pr_preview" {
+		labelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
+		bodyStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
+		s := titleStyle.Render("PR Preview") + "\n\n"
+		s += labelStyle.Render("Title: ") + bodyStyle.Render(m.prTitle) + "\n\n"
+		s += labelStyle.Render("Body:") + "\n"
+		s += lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(m.prBody) + "\n\n"
+		for i, choice := range m.choices {
+			cursor := " "
+			if m.cursor == i {
+				cursor = ">"
+				choice = selectedStyle.Render(choice)
+			}
+			s += fmt.Sprintf("%s %s\n", cursor, choice)
+		}
+		s += "\n(use arrow keys to select, enter to confirm, q to quit)\n"
+		return s
 	}
 
 	if m.phase == "commit_error" {
@@ -845,6 +950,19 @@ type errMsg string
 type branchCreatedMsg string
 type commitMsgErrMsg string // API error during commit message generation
 type prContentErrMsg string // API error during PR content generation
+
+// getAvailableModels returns a list of models the user can choose from
+func getAvailableModels() []string {
+	config := getEffectiveConfig()
+	if config.Provider == "ollama" {
+		return []string{"llama3.2", "llama3.1", "codellama", "mistral", "deepseek-coder"}
+	}
+	return []string{
+		"claude-sonnet-4-5-20250929",
+		"claude-haiku-35-20241022",
+		"claude-opus-4-20250514",
+	}
+}
 
 func generateCommitMsg(diff, commitType, scope string) tea.Cmd {
 	return func() tea.Msg {
