@@ -1354,25 +1354,8 @@ func (m configModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "ctrl+c":
+		case "ctrl+c", "esc":
 			return m, tea.Quit
-
-		case "q":
-			// Only quit if not in a text input phase (model names like "qwen" need 'q')
-			if m.phase == phaseProvider || m.phase == phaseConfirm || m.phase == phaseSaved || m.phase == phaseError {
-				return m, tea.Quit
-			}
-			// In input phases, treat as text input
-			m.input += msg.String()
-
-		case "1":
-			if m.phase == phaseProvider {
-				m.provider = "anthropic"
-			}
-		case "2":
-			if m.phase == phaseProvider {
-				m.provider = "ollama"
-			}
 
 		case "enter":
 			switch m.phase {
@@ -1420,35 +1403,43 @@ func (m configModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 
-		case "y":
-			if m.phase == phaseConfirm {
-				// Save the config
-				newConfig := &Config{
-					Provider:  m.provider,
-					Model:     m.model,
-					OllamaURL: m.ollamaURL,
-				}
-				if err := saveConfig(newConfig); err != nil {
-					m.errorMsg = err.Error()
-					m.phase = phaseError
-				} else {
-					m.phase = phaseSaved
-					return m, tea.Quit
-				}
-			}
-		case "n":
-			if m.phase == phaseConfirm {
-				return m, tea.Quit
-			}
-
 		case "backspace":
 			if len(m.input) > 0 {
 				m.input = m.input[:len(m.input)-1]
 			}
 
 		default:
-			if len(msg.String()) == 1 && m.phase != phaseProvider && m.phase != phaseConfirm && m.phase != phaseSaved && m.phase != phaseError {
-				m.input += msg.String()
+			key := msg.String()
+			if len(key) != 1 {
+				break
+			}
+			switch m.phase {
+			case phaseProvider:
+				if key == "1" {
+					m.provider = "anthropic"
+				} else if key == "2" {
+					m.provider = "ollama"
+				}
+			case phaseConfirm:
+				if key == "y" {
+					// Save the config
+					newConfig := &Config{
+						Provider:  m.provider,
+						Model:     m.model,
+						OllamaURL: m.ollamaURL,
+					}
+					if err := saveConfig(newConfig); err != nil {
+						m.errorMsg = err.Error()
+						m.phase = phaseError
+					} else {
+						m.phase = phaseSaved
+						return m, tea.Quit
+					}
+				} else if key == "n" {
+					return m, tea.Quit
+				}
+			case phaseAnthropicModel, phaseOllamaModel, phaseOllamaURL:
+				m.input += key
 			}
 		}
 
@@ -1468,7 +1459,7 @@ func (m configModel) View() string {
 	if m.phase == phaseError {
 		s := titleStyle.Render("Error saving configuration") + "\n\n"
 		s += errorStyle.Render(m.errorMsg) + "\n\n"
-		s += "Press enter to exit or q to quit\n"
+		s += "Press enter to exit or esc to quit\n"
 		return s
 	}
 
@@ -1542,7 +1533,7 @@ func (m configModel) View() string {
 		s += titleStyle.Render("Save this configuration?") + "\n\n"
 		s += "  [y] Yes, save\n"
 		s += "  [n] No, cancel\n\n"
-		s += "(press y to save, n to cancel, q to quit)\n"
+		s += "(press y to save, n to cancel, esc to quit)\n"
 		return s
 	}
 
