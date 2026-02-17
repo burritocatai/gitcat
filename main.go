@@ -28,19 +28,41 @@ const (
 
 // Config represents the application configuration
 type Config struct {
-	Provider  string `json:"provider"`   // "anthropic" or "ollama"
-	Model     string `json:"model"`      // Model name
-	OllamaURL string `json:"ollama_url"` // Ollama server URL
+	Provider    string `json:"provider"`               // "anthropic" or "ollama"
+	Model       string `json:"model"`                  // Default model name (fallback)
+	CommitModel string `json:"commit_model,omitempty"` // Model for commit message generation
+	PRModel     string `json:"pr_model,omitempty"`     // Model for PR description generation
+	OllamaURL   string `json:"ollama_url"`             // Ollama server URL
+}
+
+// GetCommitModel returns the model to use for commit message generation.
+// Falls back to the default Model if CommitModel is not set.
+func (c *Config) GetCommitModel() string {
+	if c.CommitModel != "" {
+		return c.CommitModel
+	}
+	return c.Model
+}
+
+// GetPRModel returns the model to use for PR description generation.
+// Falls back to the default Model if PRModel is not set.
+func (c *Config) GetPRModel() string {
+	if c.PRModel != "" {
+		return c.PRModel
+	}
+	return c.Model
 }
 
 var (
-	modelFlag    = flag.String("model", "", "Model to use (overrides config)")
-	mFlag        = flag.String("m", "", "Model to use (shorthand, overrides config)")
-	providerFlag = flag.String("provider", "", "LLM provider: anthropic or ollama (overrides config)")
-	pFlag        = flag.String("p", "", "LLM provider (shorthand, overrides config)")
-	ollamaURLFlag = flag.String("ollama-url", "", "Ollama server URL (overrides config)")
-	prFlag        = flag.Bool("pr", false, "Generate a PR from existing commits without committing")
-	appConfig    *Config
+	modelFlag       = flag.String("model", "", "Model to use for both commit and PR (overrides config)")
+	mFlag           = flag.String("m", "", "Model to use for both commit and PR (shorthand, overrides config)")
+	commitModelFlag = flag.String("commit-model", "", "Model for commit message generation (overrides config)")
+	prModelFlag     = flag.String("pr-model", "", "Model for PR description generation (overrides config)")
+	providerFlag    = flag.String("provider", "", "LLM provider: anthropic or ollama (overrides config)")
+	pFlag           = flag.String("p", "", "LLM provider (shorthand, overrides config)")
+	ollamaURLFlag   = flag.String("ollama-url", "", "Ollama server URL (overrides config)")
+	prFlag          = flag.Bool("pr", false, "Generate a PR from existing commits without committing")
+	appConfig       *Config
 )
 
 type AnthropicRequest struct {
@@ -170,13 +192,21 @@ func getEffectiveConfig() *Config {
 		config.Provider = provider
 	}
 
-	// Apply model override
+	// Apply model override: -m/--model overrides the default model for both
 	model := *modelFlag
 	if *mFlag != "" {
 		model = *mFlag
 	}
 	if model != "" {
 		config.Model = model
+	}
+
+	// Apply specific model overrides (take precedence over -m/--model)
+	if *commitModelFlag != "" {
+		config.CommitModel = *commitModelFlag
+	}
+	if *prModelFlag != "" {
+		config.PRModel = *prModelFlag
 	}
 
 	// Apply Ollama URL override
@@ -882,6 +912,8 @@ type prContentErrMsg string // API error during PR content generation
 func generateCommitMsg(diff, commitType, scope string) tea.Cmd {
 	return func() tea.Msg {
 		config := getEffectiveConfig()
+		// Use the commit-specific model
+		config.Model = config.GetCommitModel()
 
 		prompt := fmt.Sprintf(`You are a commit message generator. Based on the following git diff, generate a concise commit message using conventional commits format.
 
@@ -1274,6 +1306,8 @@ func getGitLog(branch string) (string, error) {
 func generatePRContent(branch string) tea.Cmd {
 	return func() tea.Msg {
 		config := getEffectiveConfig()
+		// Use the PR-specific model
+		config.Model = config.GetPRModel()
 
 		gitLog, err := getGitLog(branch)
 		if err != nil {
@@ -1317,32 +1351,42 @@ func createPR(title, body string) error {
 
 // Config TUI model for endpoint configuration
 type configModel struct {
-	phase      string // "provider", "anthropic_model", "ollama_model", "ollama_url", "confirm", "saved", "error"
-	provider   string
-	model      string
-	ollamaURL  string
-	input      string // Current input value
-	errorMsg   string
-	configPath string
+	phase       string // "provider", "commit_model", "pr_model", "ollama_url", "confirm", "saved", "error"
+	provider    string
+	commitModel string
+	prModel     string
+	ollamaURL   string
+	input       string // Current input value
+	errorMsg    string
+	configPath  string
 }
 
 const (
-	phaseProvider       = "provider"
-	phaseAnthropicModel = "anthropic_model"
-	phaseOllamaModel    = "ollama_model"
-	phaseOllamaURL      = "ollama_url"
-	phaseConfirm        = "confirm"
-	phaseSaved          = "saved"
-	phaseError          = "error"
+	phaseProvider    = "provider"
+	phaseCommitModel = "commit_model"
+	phasePRModel     = "pr_model"
+	phaseOllamaURL   = "ollama_url"
+	phaseConfirm     = "confirm"
+	phaseSaved       = "saved"
+	phaseError       = "error"
 )
 
 func initialConfigModel(config *Config, configPath string) configModel {
+	commitModel := config.CommitModel
+	if commitModel == "" {
+		commitModel = config.Model
+	}
+	prModel := config.PRModel
+	if prModel == "" {
+		prModel = config.Model
+	}
 	return configModel{
-		phase:      phaseProvider,
-		provider:   config.Provider,
-		model:      config.Model,
-		ollamaURL:  config.OllamaURL,
-		configPath: configPath,
+		phase:       phaseProvider,
+		provider:    config.Provider,
+		commitModel: commitModel,
+		prModel:     prModel,
+		ollamaURL:   config.OllamaURL,
+		configPath:  configPath,
 	}
 }
 
@@ -1360,24 +1404,24 @@ func (m configModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			switch m.phase {
 			case phaseProvider:
-				m.phase = phaseAnthropicModel
-				m.input = m.model
-			case phaseAnthropicModel:
+				m.phase = phaseCommitModel
+				m.input = m.commitModel
+			case phaseCommitModel:
 				if m.input != "" {
-					m.model = m.input
+					m.commitModel = m.input
+				}
+				m.phase = phasePRModel
+				m.input = m.prModel
+			case phasePRModel:
+				if m.input != "" {
+					m.prModel = m.input
 				}
 				if m.provider == "ollama" {
-					m.phase = phaseOllamaModel
-					m.input = m.model
+					m.phase = phaseOllamaURL
+					m.input = m.ollamaURL
 				} else {
 					m.phase = phaseConfirm
 				}
-			case phaseOllamaModel:
-				if m.input != "" {
-					m.model = m.input
-				}
-				m.phase = phaseOllamaURL
-				m.input = m.ollamaURL
 			case phaseOllamaURL:
 				if m.input != "" {
 					m.ollamaURL = m.input
@@ -1386,10 +1430,13 @@ func (m configModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case phaseConfirm:
 				// Save the config
 				newConfig := &Config{
-					Provider:  m.provider,
-					Model:     m.model,
-					OllamaURL: m.ollamaURL,
+					Provider:    m.provider,
+					CommitModel: m.commitModel,
+					PRModel:     m.prModel,
+					OllamaURL:   m.ollamaURL,
 				}
+				// Set Model as fallback for backward compatibility
+				newConfig.Model = m.commitModel
 				if err := saveConfig(newConfig); err != nil {
 					m.errorMsg = err.Error()
 					m.phase = phaseError
@@ -1424,10 +1471,13 @@ func (m configModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if key == "y" {
 					// Save the config
 					newConfig := &Config{
-						Provider:  m.provider,
-						Model:     m.model,
-						OllamaURL: m.ollamaURL,
+						Provider:    m.provider,
+						CommitModel: m.commitModel,
+						PRModel:     m.prModel,
+						OllamaURL:   m.ollamaURL,
 					}
+					// Set Model as fallback for backward compatibility
+					newConfig.Model = m.commitModel
 					if err := saveConfig(newConfig); err != nil {
 						m.errorMsg = err.Error()
 						m.phase = phaseError
@@ -1438,7 +1488,7 @@ func (m configModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else if key == "n" {
 					return m, tea.Quit
 				}
-			case phaseAnthropicModel, phaseOllamaModel, phaseOllamaURL:
+			case phaseCommitModel, phasePRModel, phaseOllamaURL:
 				m.input += key
 			}
 		}
@@ -1467,7 +1517,8 @@ func (m configModel) View() string {
 		successStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
 		s := successStyle.Render("✓ Configuration saved successfully!") + "\n\n"
 		s += labelStyle.Render("Provider:") + " " + m.provider + "\n"
-		s += labelStyle.Render("Model:") + " " + m.model + "\n"
+		s += labelStyle.Render("Commit model:") + " " + m.commitModel + "\n"
+		s += labelStyle.Render("PR model:") + " " + m.prModel + "\n"
 		if m.provider == "ollama" {
 			s += labelStyle.Render("Ollama URL:") + " " + m.ollamaURL + "\n"
 		}
@@ -1491,22 +1542,31 @@ func (m configModel) View() string {
 		return s
 	}
 
-	if m.phase == phaseAnthropicModel {
-		s := titleStyle.Render("Configure Anthropic Model") + "\n\n"
-		s += labelStyle.Render("Provider:") + " anthropic\n\n"
-		s += "Enter model name:\n"
+	if m.phase == phaseCommitModel {
+		defaultModel := defaultAnthropicModel
+		if m.provider == "ollama" {
+			defaultModel = defaultOllamaModel
+		}
+		s := titleStyle.Render("Configure Commit Model") + "\n\n"
+		s += labelStyle.Render("Provider:") + " " + m.provider + "\n\n"
+		s += "Enter model for commit message generation (fast model recommended):\n"
 		s += fmt.Sprintf("> %s_\n", m.input)
-		s += "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("Default: "+defaultAnthropicModel) + "\n"
+		s += "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("Default: "+defaultModel) + "\n"
 		s += "(press enter when done)\n"
 		return s
 	}
 
-	if m.phase == phaseOllamaModel {
-		s := titleStyle.Render("Configure Ollama Model") + "\n\n"
-		s += labelStyle.Render("Provider:") + " ollama\n\n"
-		s += "Enter model name:\n"
+	if m.phase == phasePRModel {
+		defaultModel := defaultAnthropicModel
+		if m.provider == "ollama" {
+			defaultModel = defaultOllamaModel
+		}
+		s := titleStyle.Render("Configure PR Model") + "\n\n"
+		s += labelStyle.Render("Provider:") + " " + m.provider + "\n"
+		s += labelStyle.Render("Commit model:") + " " + m.commitModel + "\n\n"
+		s += "Enter model for PR description generation (smarter model recommended):\n"
 		s += fmt.Sprintf("> %s_\n", m.input)
-		s += "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("Default: "+defaultOllamaModel) + "\n"
+		s += "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("Default: "+defaultModel) + "\n"
 		s += "(press enter when done)\n"
 		return s
 	}
@@ -1514,7 +1574,8 @@ func (m configModel) View() string {
 	if m.phase == phaseOllamaURL {
 		s := titleStyle.Render("Configure Ollama Server URL") + "\n\n"
 		s += labelStyle.Render("Provider:") + " ollama\n"
-		s += labelStyle.Render("Model:") + " " + m.model + "\n\n"
+		s += labelStyle.Render("Commit model:") + " " + m.commitModel + "\n"
+		s += labelStyle.Render("PR model:") + " " + m.prModel + "\n\n"
 		s += "Enter Ollama server URL:\n"
 		s += fmt.Sprintf("> %s_\n", m.input)
 		s += "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("Default: "+defaultOllamaURL) + "\n"
@@ -1525,7 +1586,8 @@ func (m configModel) View() string {
 	if m.phase == phaseConfirm {
 		s := titleStyle.Render("Confirm Configuration") + "\n\n"
 		s += labelStyle.Render("Provider:") + " " + m.provider + "\n"
-		s += labelStyle.Render("Model:") + " " + m.model + "\n"
+		s += labelStyle.Render("Commit model:") + " " + m.commitModel + "\n"
+		s += labelStyle.Render("PR model:") + " " + m.prModel + "\n"
 		if m.provider == "ollama" {
 			s += labelStyle.Render("Ollama URL:") + " " + m.ollamaURL + "\n"
 		}
@@ -1568,24 +1630,31 @@ USAGE:
     gitcat [OPTIONS]
 
 OPTIONS:
-    -m, --model <model>           Model to use (overrides config)
+    -m, --model <model>           Model to use for both commit and PR (overrides config)
+    --commit-model <model>        Model for commit message generation (overrides config and -m)
+    --pr-model <model>            Model for PR description generation (overrides config and -m)
     -p, --provider <provider>     LLM provider: anthropic or ollama (overrides config)
     --ollama-url <url>            Ollama server URL (overrides config)
     --pr                          Generate a PR from existing commits (no commit required)
 
 SUBCOMMANDS:
-    config                        Open configuration TUI to set provider, model, and endpoints
+    config                        Open configuration TUI to set provider, models, and endpoints
     help                          Show this help message
 
 EXAMPLES:
     gitcat                        Generate a commit message with default config
-    gitcat -m claude-3-opus       Use a specific model
+    gitcat -m claude-3-opus       Use a specific model for both commit and PR
+    gitcat --commit-model claude-haiku-3-5-20241022 --pr-model claude-sonnet-4-5-20250929
+                                  Use a fast model for commits, smarter model for PRs
     gitcat -p ollama              Use Ollama provider
     gitcat --pr                   Generate a PR from current branch commits
     gitcat config                 Configure endpoints and settings
 
 CONFIGURATION:
     Config is stored in: ~/.config/gitcat/config.json
+    Separate models can be configured for commit messages and PR descriptions.
+    Use 'gitcat config' to set them interactively.
+
     Available providers:
       - anthropic: Requires ANTHROPIC_API_KEY environment variable
       - ollama: Local Ollama instance for running open-source models`)
