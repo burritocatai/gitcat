@@ -1366,15 +1366,17 @@ func generatePRContent(branch string) tea.Cmd {
 
 		prompt := fmt.Sprintf(`You are a pull request generator. Based on the following git log from a branch, generate a clear and concise pull request title and body.
 
+IMPORTANT: Only describe changes that are explicitly mentioned in the git log. Do NOT infer, assume, or fabricate details that are not directly present in the commits. If the log is vague, keep the description general rather than guessing specifics.
+
 Git log:
 %s
 
 Generate:
 1. A clear, concise PR title (max 72 characters) that summarizes the changes
-2. A detailed PR body that:
-   - Summarizes the changes in bullet points
-   - Explains the motivation and context
-   - Notes any breaking changes or important details
+2. A PR body that:
+   - Summarizes the changes in bullet points based strictly on the commit messages
+   - Notes any breaking changes if explicitly mentioned
+   - Do NOT add implementation details, test descriptions, or context that is not in the log
 
 Format your response as:
 [PR Title]
