@@ -24,6 +24,7 @@ const (
 	defaultOllamaURL      = "http://localhost:11434"
 	anthropicURL          = "https://api.anthropic.com/v1/messages"
 	diffLineSizeLimit     = 1000 // Skip AI generation for diffs larger than this
+	prTitleMaxLen         = 256  // Maximum PR title length allowed by GitHub
 )
 
 // Config represents the application configuration
@@ -529,17 +530,37 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, tea.Quit
 				}
 			} else if m.phase == "pr_manual_title" {
+				if len(m.prTitle) > prTitleMaxLen {
+					m.prTitle = m.prTitle[:prTitleMaxLen]
+				}
 				// Move to body input
 				m.phase = "pr_manual_body"
 			} else if m.phase == "pr_manual_body" {
-				// Create the PR
-				if err := createPR(m.prTitle, m.prBody); err != nil {
-					m.errorMsg = fmt.Sprintf("Error creating PR: %v", err)
+				// Show PR preview before creating
+				m.phase = "pr_confirm"
+				m.cursor = 0
+				m.choices = []string{"Yes, create PR", "Edit title", "Edit body", "Skip"}
+			} else if m.phase == "pr_confirm" {
+				if m.cursor == 0 {
+					// Create the PR
+					if err := createPR(m.prTitle, m.prBody); err != nil {
+						m.errorMsg = fmt.Sprintf("Error creating PR: %v", err)
+						return m, tea.Quit
+					}
+					m.didCreatePR = true
+					m.phase = "pr_creating"
+					return m, tea.Quit
+				} else if m.cursor == 1 {
+					// Edit title
+					m.phase = "pr_manual_title"
+				} else if m.cursor == 2 {
+					// Edit body
+					m.phase = "pr_manual_body"
+				} else {
+					// Skip
+					m.phase = "exiting"
 					return m, tea.Quit
 				}
-				m.didCreatePR = true
-				m.phase = "pr_creating"
-				return m, tea.Quit
 			}
 
 		case "backspace":
@@ -567,7 +588,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.generatedMsg += msg.String()
 				}
 			} else if m.phase == "pr_manual_title" {
-				if len(msg.String()) == 1 {
+				if len(msg.String()) == 1 && len(m.prTitle) < prTitleMaxLen {
 					m.prTitle += msg.String()
 				}
 			} else if m.phase == "pr_manual_body" {
@@ -594,13 +615,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.prTitle = string(msg)
 			m.prBody = ""
 		}
-		if err := createPR(m.prTitle, m.prBody); err != nil {
-			m.errorMsg = fmt.Sprintf("Error creating PR: %v", err)
-			return m, tea.Quit
+		// Truncate title if it exceeds GitHub's limit
+		if len(m.prTitle) > prTitleMaxLen {
+			m.prTitle = m.prTitle[:prTitleMaxLen]
 		}
-		m.didCreatePR = true
-		m.phase = "pr_creating"
-		return m, tea.Quit
+		m.phase = "pr_confirm"
+		m.cursor = 0
+		m.choices = []string{"Yes, create PR", "Edit title", "Edit body", "Skip"}
 
 	case branchCreatedMsg:
 		// Branch created successfully, update current branch name
@@ -872,7 +893,11 @@ func (m model) View() string {
 	if m.phase == "pr_manual_title" {
 		s := titleStyle.Render("Enter PR title:") + "\n\n"
 		s += fmt.Sprintf("> %s_\n\n", m.prTitle)
-		s += lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("Tip: Keep it concise and descriptive (max 72 chars)") + "\n"
+		counterColor := "8"
+		if len(m.prTitle) >= prTitleMaxLen {
+			counterColor = "9"
+		}
+		s += lipgloss.NewStyle().Foreground(lipgloss.Color(counterColor)).Render(fmt.Sprintf("(%d/%d characters)", len(m.prTitle), prTitleMaxLen)) + "\n"
 		s += "\n(type your title, press enter to continue to body)\n"
 		return s
 	}
@@ -882,7 +907,32 @@ func (m model) View() string {
 		s += lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Render(fmt.Sprintf("Title: %s", m.prTitle)) + "\n\n"
 		s += fmt.Sprintf("%s_\n\n", m.prBody)
 		s += lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("Tip: Describe your changes, press enter for newlines") + "\n"
-		s += "\n(type your body, press enter twice to create PR)\n"
+		s += "\n(type your body, press enter twice to continue)\n"
+		return s
+	}
+
+	if m.phase == "pr_confirm" {
+		s := titleStyle.Render("PR Preview") + "\n\n"
+		s += lipgloss.NewStyle().Bold(true).Render("Title: ") + lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Render(m.prTitle) + "\n"
+		counterColor := "8"
+		if len(m.prTitle) > prTitleMaxLen {
+			counterColor = "9"
+		}
+		s += lipgloss.NewStyle().Foreground(lipgloss.Color(counterColor)).Render(fmt.Sprintf("       (%d/%d characters)", len(m.prTitle), prTitleMaxLen)) + "\n\n"
+		if m.prBody != "" {
+			s += lipgloss.NewStyle().Bold(true).Render("Body:") + "\n"
+			s += lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Render(m.prBody) + "\n\n"
+		}
+		s += titleStyle.Render("Create this PR?") + "\n\n"
+		for i, choice := range m.choices {
+			cursor := " "
+			if m.cursor == i {
+				cursor = ">"
+				choice = selectedStyle.Render(choice)
+			}
+			s += fmt.Sprintf("%s %s\n", cursor, choice)
+		}
+		s += "\n(use arrow keys to select, enter to confirm, q to quit)\n"
 		return s
 	}
 
