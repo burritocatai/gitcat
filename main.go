@@ -39,6 +39,7 @@ var (
 	providerFlag = flag.String("provider", "", "LLM provider: anthropic or ollama (overrides config)")
 	pFlag        = flag.String("p", "", "LLM provider (shorthand, overrides config)")
 	ollamaURLFlag = flag.String("ollama-url", "", "Ollama server URL (overrides config)")
+	prFlag        = flag.Bool("pr", false, "Generate a PR from existing commits without committing")
 	appConfig    *Config
 )
 
@@ -213,16 +214,21 @@ type model struct {
 
 	// API error context for retry capability
 	apiErrorMsg string // Stores the API error message to display
+
+	// PR-only mode (--pr flag)
+	prOnly bool
 }
 
-func initialModel(diff string, needsAdd bool, currentBranch string, isProtectedBranch bool) model {
+func initialModel(diff string, needsAdd bool, currentBranch string, isProtectedBranch bool, prOnly bool) model {
 	commitTypes := []string{"feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore"}
 
 	// Determine initial phase based on conditions
 	phase := "type"
 	choices := []string{"Yes, add all changes", "No, exit"}
 
-	if isProtectedBranch {
+	if prOnly {
+		phase = "pr_generating"
+	} else if isProtectedBranch {
 		phase = "branch_warning"
 		choices = []string{"Yes, create a new branch", fmt.Sprintf("No, continue on %s", currentBranch)}
 	} else if needsAdd {
@@ -239,10 +245,14 @@ func initialModel(diff string, needsAdd bool, currentBranch string, isProtectedB
 		currentBranch:     currentBranch,
 		isProtectedBranch: isProtectedBranch,
 		branchInput:       generateDefaultBranchName(),
+		prOnly:            prOnly,
 	}
 }
 
 func (m model) Init() tea.Cmd {
+	if m.prOnly {
+		return generatePRContent(m.currentBranch)
+	}
 	return nil
 }
 
@@ -250,8 +260,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "ctrl+c", "q":
+		case "ctrl+c":
 			return m, tea.Quit
+
+		case "q":
+			// Only quit if not in an input phase where 'q' should be typed (e.g. model names like "qwen")
+			if m.phase != "branch_input" && m.phase != "scope" && m.phase != "edit" && m.phase != "manual_input" && m.phase != "pr_manual_title" && m.phase != "pr_manual_body" {
+				return m, tea.Quit
+			}
+			// Fall through to default handler for text input
+			if m.phase == "branch_input" {
+				m.branchInput += msg.String()
+			} else if m.phase == "scope" {
+				m.scopeInput += msg.String()
+			} else if m.phase == "edit" || m.phase == "manual_input" {
+				m.generatedMsg += msg.String()
+			} else if m.phase == "pr_manual_title" {
+				m.prTitle += msg.String()
+			} else if m.phase == "pr_manual_body" {
+				m.prBody += msg.String()
+			}
 
 		case "up", "k":
 			// Only handle as navigation if not in input phase
@@ -578,6 +606,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) getSummary() string {
+	// PR-only mode summary
+	if m.prOnly && m.didCreatePR {
+		return fmt.Sprintf("Created PR on branch %s", m.currentBranch)
+	}
+
 	if !m.didCommit {
 		return ""
 	}
@@ -1321,8 +1354,16 @@ func (m configModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "ctrl+c", "q":
+		case "ctrl+c":
 			return m, tea.Quit
+
+		case "q":
+			// Only quit if not in a text input phase (model names like "qwen" need 'q')
+			if m.phase == phaseProvider || m.phase == phaseConfirm || m.phase == phaseSaved || m.phase == phaseError {
+				return m, tea.Quit
+			}
+			// In input phases, treat as text input
+			m.input += msg.String()
 
 		case "1":
 			if m.phase == phaseProvider {
@@ -1539,6 +1580,7 @@ OPTIONS:
     -m, --model <model>           Model to use (overrides config)
     -p, --provider <provider>     LLM provider: anthropic or ollama (overrides config)
     --ollama-url <url>            Ollama server URL (overrides config)
+    --pr                          Generate a PR from existing commits (no commit required)
 
 SUBCOMMANDS:
     config                        Open configuration TUI to set provider, model, and endpoints
@@ -1548,6 +1590,7 @@ EXAMPLES:
     gitcat                        Generate a commit message with default config
     gitcat -m claude-3-opus       Use a specific model
     gitcat -p ollama              Use Ollama provider
+    gitcat --pr                   Generate a PR from current branch commits
     gitcat config                 Configure endpoints and settings
 
 CONFIGURATION:
@@ -1590,6 +1633,32 @@ func main() {
 		}
 	}
 
+	// Handle --pr flag: skip commit flow and generate PR directly
+	if *prFlag {
+		currentBranch, err := getCurrentBranch()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error getting current branch: %v\n", err)
+			os.Exit(1)
+		}
+
+		if err := isGitHubOrigin(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		if hasExistingPR(currentBranch) {
+			fmt.Fprintf(os.Stderr, "A pull request already exists for branch '%s'.\n", currentBranch)
+			os.Exit(1)
+		}
+
+		p := tea.NewProgram(initialModel("", false, currentBranch, false, true))
+		if _, err := p.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error running program: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	diff, err := getGitDiff()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error getting git diff: %v\n", err)
@@ -1618,7 +1687,7 @@ func main() {
 
 	isProtectedBranch := currentBranch == "main" || currentBranch == "master"
 
-	p := tea.NewProgram(initialModel(diff, needsAdd, currentBranch, isProtectedBranch))
+	p := tea.NewProgram(initialModel(diff, needsAdd, currentBranch, isProtectedBranch, false))
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error running program: %v\n", err)
 		os.Exit(1)
