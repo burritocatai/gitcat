@@ -321,7 +321,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.cursor--
 				} else if m.phase == "type" && m.typeSelected > 0 {
 					m.typeSelected--
-				} else if (m.phase == "push_prompt" || m.phase == "upstream_prompt" || m.phase == "pr_prompt" || m.phase == "confirm" || m.phase == "commit_error" || m.phase == "pr_error") && m.cursor > 0 {
+				} else if (m.phase == "push_prompt" || m.phase == "upstream_prompt" || m.phase == "pr_prompt" || m.phase == "pr_confirm" || m.phase == "confirm" || m.phase == "commit_error" || m.phase == "pr_error") && m.cursor > 0 {
 					m.cursor--
 				}
 			} else if msg.String() == "k" && len(msg.String()) == 1 {
@@ -348,7 +348,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.cursor++
 				} else if m.phase == "type" && m.typeSelected < len(m.commitTypes)-1 {
 					m.typeSelected++
-				} else if (m.phase == "push_prompt" || m.phase == "upstream_prompt" || m.phase == "pr_prompt" || m.phase == "confirm" || m.phase == "commit_error" || m.phase == "pr_error") && m.cursor < len(m.choices)-1 {
+				} else if (m.phase == "push_prompt" || m.phase == "upstream_prompt" || m.phase == "pr_prompt" || m.phase == "pr_confirm" || m.phase == "confirm" || m.phase == "commit_error" || m.phase == "pr_error") && m.cursor < len(m.choices)-1 {
 					m.cursor++
 				}
 			} else if msg.String() == "j" && len(msg.String()) == 1 {
