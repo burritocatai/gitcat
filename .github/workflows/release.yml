@@ -2,7 +2,7 @@ name: Release
 on:
   push:
     branches: [main]
-    paths-ignore: [".github/**"]
+    paths-ignore: [".github/**", "README.md"]
 
 permissions:
   contents: write
