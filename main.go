@@ -1695,10 +1695,12 @@ func (m configModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if key == "y" {
 					// Save the config
 					newConfig := &Config{
-						Provider:    m.provider,
-						CommitModel: m.commitModel,
-						PRModel:     m.prModel,
-						OllamaURL:   m.ollamaURL,
+						Provider:     m.provider,
+						CommitModel:  m.commitModel,
+						PRModel:      m.prModel,
+						OllamaURL:    m.ollamaURL,
+						OpenAIURL:    m.openaiURL,
+						OpenAIAPIKey: m.openaiAPIKey,
 					}
 					// Set Model as fallback for backward compatibility
 					newConfig.Model = m.commitModel
