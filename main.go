@@ -21,6 +21,7 @@ import (
 const (
 	defaultAnthropicModel = "claude-sonnet-4-5-20250929"
 	defaultOllamaModel    = "llama3.2"
+	defaultOpenAIModel    = "gpt-4o"
 	defaultOllamaURL      = "http://localhost:11434"
 	anthropicURL          = "https://api.anthropic.com/v1/messages"
 	diffLineSizeLimit     = 1000 // Skip AI generation for diffs larger than this
@@ -29,11 +30,13 @@ const (
 
 // Config represents the application configuration
 type Config struct {
-	Provider    string `json:"provider"`               // "anthropic" or "ollama"
+	Provider    string `json:"provider"`               // "anthropic", "ollama", or "openai"
 	Model       string `json:"model"`                  // Default model name (fallback)
 	CommitModel string `json:"commit_model,omitempty"` // Model for commit message generation
 	PRModel     string `json:"pr_model,omitempty"`     // Model for PR description generation
 	OllamaURL   string `json:"ollama_url"`             // Ollama server URL
+	OpenAIURL   string `json:"openai_url,omitempty"`   // OpenAI-compatible endpoint URL
+	OpenAIAPIKey string `json:"openai_api_key,omitempty"` // OpenAI-compatible API key
 }
 
 // GetCommitModel returns the model to use for commit message generation.
@@ -59,9 +62,11 @@ var (
 	mFlag           = flag.String("m", "", "Model to use for both commit and PR (shorthand, overrides config)")
 	commitModelFlag = flag.String("commit-model", "", "Model for commit message generation (overrides config)")
 	prModelFlag     = flag.String("pr-model", "", "Model for PR description generation (overrides config)")
-	providerFlag    = flag.String("provider", "", "LLM provider: anthropic or ollama (overrides config)")
+	providerFlag    = flag.String("provider", "", "LLM provider: anthropic, ollama, or openai (overrides config)")
 	pFlag           = flag.String("p", "", "LLM provider (shorthand, overrides config)")
 	ollamaURLFlag   = flag.String("ollama-url", "", "Ollama server URL (overrides config)")
+	openaiURLFlag   = flag.String("openai-url", "", "OpenAI-compatible endpoint URL (overrides config)")
+	openaiAPIKeyFlag = flag.String("openai-api-key", "", "OpenAI-compatible API key (overrides config)")
 	prFlag          = flag.Bool("pr", false, "Generate a PR from existing commits without committing")
 	appConfig       *Config
 )
@@ -84,6 +89,26 @@ type AnthropicResponse struct {
 type ContentBlock struct {
 	Type string `json:"type"`
 	Text string `json:"text"`
+}
+
+// OpenAI-compatible API types (for LiteLLM and similar proxies)
+type OpenAIRequest struct {
+	Model     string          `json:"model"`
+	Messages  []OpenAIMessage `json:"messages"`
+	MaxTokens int             `json:"max_tokens"`
+}
+
+type OpenAIMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type OpenAIResponse struct {
+	Choices []OpenAIChoice `json:"choices"`
+}
+
+type OpenAIChoice struct {
+	Message OpenAIMessage `json:"message"`
 }
 
 // Ollama API types
@@ -142,9 +167,12 @@ func loadConfig() (*Config, error) {
 		config.Provider = "anthropic"
 	}
 	if config.Model == "" {
-		if config.Provider == "ollama" {
+		switch config.Provider {
+		case "ollama":
 			config.Model = defaultOllamaModel
-		} else {
+		case "openai":
+			config.Model = defaultOpenAIModel
+		default:
 			config.Model = defaultAnthropicModel
 		}
 	}
@@ -213,6 +241,14 @@ func getEffectiveConfig() *Config {
 	// Apply Ollama URL override
 	if *ollamaURLFlag != "" {
 		config.OllamaURL = *ollamaURLFlag
+	}
+
+	// Apply OpenAI overrides
+	if *openaiURLFlag != "" {
+		config.OpenAIURL = *openaiURLFlag
+	}
+	if *openaiAPIKeyFlag != "" {
+		config.OpenAIAPIKey = *openaiAPIKeyFlag
 	}
 
 	return &config
@@ -984,10 +1020,14 @@ Git diff:
 
 Respond with ONLY the commit message, no explanations or markdown formatting.`, commitType, scope, commitType, scope, diff)
 
-		if config.Provider == "ollama" {
+		switch config.Provider {
+		case "ollama":
 			return generateWithOllama(config, prompt, 1024, false)
+		case "openai":
+			return generateWithOpenAI(config, prompt, 1024, false)
+		default:
+			return generateWithAnthropic(config, prompt, 1024, false)
 		}
-		return generateWithAnthropic(config, prompt, 1024, false)
 	}
 }
 
@@ -1158,6 +1198,109 @@ func generateWithOllama(config *Config, prompt string, _ int, isPR bool) tea.Msg
 		return commitMsgErrMsg("No content in Ollama API response")
 	}
 
+	if isPR {
+		return prContentMsg(result)
+	}
+	return commitMsgMsg(result)
+}
+
+// generateWithOpenAI sends a request to an OpenAI-compatible API (e.g. LiteLLM)
+func generateWithOpenAI(config *Config, prompt string, maxTokens int, isPR bool) tea.Msg {
+	if config.OpenAIURL == "" {
+		msg := "OpenAI endpoint URL not configured. Set it via --openai-url or 'gitcat config'"
+		if isPR {
+			return prContentErrMsg(msg)
+		}
+		return commitMsgErrMsg(msg)
+	}
+
+	apiKey := config.OpenAIAPIKey
+	if apiKey == "" {
+		apiKey = os.Getenv("OPENAI_API_KEY")
+	}
+	if apiKey == "" {
+		msg := "OpenAI API key not set. Use --openai-api-key, config, or OPENAI_API_KEY env var"
+		if isPR {
+			return prContentErrMsg(msg)
+		}
+		return commitMsgErrMsg(msg)
+	}
+
+	reqBody := OpenAIRequest{
+		Model:     config.Model,
+		MaxTokens: maxTokens,
+		Messages: []OpenAIMessage{
+			{
+				Role:    "user",
+				Content: prompt,
+			},
+		},
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		if isPR {
+			return prContentErrMsg(fmt.Sprintf("Error marshaling request: %v", err))
+		}
+		return commitMsgErrMsg(fmt.Sprintf("Error marshaling request: %v", err))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	endpoint := strings.TrimRight(config.OpenAIURL, "/") + "/v1/chat/completions"
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewBuffer(jsonData))
+	if err != nil {
+		if isPR {
+			return prContentErrMsg(fmt.Sprintf("Error creating request: %v", err))
+		}
+		return commitMsgErrMsg(fmt.Sprintf("Error creating request: %v", err))
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		if isPR {
+			return prContentErrMsg(fmt.Sprintf("Error making request to %s: %v", endpoint, err))
+		}
+		return commitMsgErrMsg(fmt.Sprintf("Error making request to %s: %v", endpoint, err))
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		if isPR {
+			return prContentErrMsg(fmt.Sprintf("Error reading response: %v", err))
+		}
+		return commitMsgErrMsg(fmt.Sprintf("Error reading response: %v", err))
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		if isPR {
+			return prContentErrMsg(fmt.Sprintf("API error (%d): %s", resp.StatusCode, string(body)))
+		}
+		return commitMsgErrMsg(fmt.Sprintf("API error (%d): %s", resp.StatusCode, string(body)))
+	}
+
+	var apiResp OpenAIResponse
+	if err := json.Unmarshal(body, &apiResp); err != nil {
+		if isPR {
+			return prContentErrMsg(fmt.Sprintf("Error parsing response: %v", err))
+		}
+		return commitMsgErrMsg(fmt.Sprintf("Error parsing response: %v", err))
+	}
+
+	if len(apiResp.Choices) == 0 {
+		if isPR {
+			return prContentErrMsg("No choices in API response")
+		}
+		return commitMsgErrMsg("No choices in API response")
+	}
+
+	result := strings.TrimSpace(apiResp.Choices[0].Message.Content)
 	if isPR {
 		return prContentMsg(result)
 	}
@@ -1385,10 +1528,14 @@ Format your response as:
 
 Respond with ONLY the title and body in this format, no explanations or markdown code blocks.`, gitLog)
 
-		if config.Provider == "ollama" {
+		switch config.Provider {
+		case "ollama":
 			return generateWithOllama(config, prompt, 2048, true)
+		case "openai":
+			return generateWithOpenAI(config, prompt, 2048, true)
+		default:
+			return generateWithAnthropic(config, prompt, 2048, true)
 		}
-		return generateWithAnthropic(config, prompt, 2048, true)
 	}
 }
 
@@ -1403,24 +1550,28 @@ func createPR(title, body string) error {
 
 // Config TUI model for endpoint configuration
 type configModel struct {
-	phase       string // "provider", "commit_model", "pr_model", "ollama_url", "confirm", "saved", "error"
-	provider    string
-	commitModel string
-	prModel     string
-	ollamaURL   string
-	input       string // Current input value
-	errorMsg    string
-	configPath  string
+	phase        string // "provider", "commit_model", "pr_model", "ollama_url", "openai_url", "openai_api_key", "confirm", "saved", "error"
+	provider     string
+	commitModel  string
+	prModel      string
+	ollamaURL    string
+	openaiURL    string
+	openaiAPIKey string
+	input        string // Current input value
+	errorMsg     string
+	configPath   string
 }
 
 const (
-	phaseProvider    = "provider"
-	phaseCommitModel = "commit_model"
-	phasePRModel     = "pr_model"
-	phaseOllamaURL   = "ollama_url"
-	phaseConfirm     = "confirm"
-	phaseSaved       = "saved"
-	phaseError       = "error"
+	phaseProvider      = "provider"
+	phaseCommitModel   = "commit_model"
+	phasePRModel       = "pr_model"
+	phaseOllamaURL     = "ollama_url"
+	phaseOpenAIURL     = "openai_url"
+	phaseOpenAIAPIKey  = "openai_api_key"
+	phaseConfirm       = "confirm"
+	phaseSaved         = "saved"
+	phaseError         = "error"
 )
 
 func initialConfigModel(config *Config, configPath string) configModel {
@@ -1433,12 +1584,14 @@ func initialConfigModel(config *Config, configPath string) configModel {
 		prModel = config.Model
 	}
 	return configModel{
-		phase:       phaseProvider,
-		provider:    config.Provider,
-		commitModel: commitModel,
-		prModel:     prModel,
-		ollamaURL:   config.OllamaURL,
-		configPath:  configPath,
+		phase:        phaseProvider,
+		provider:     config.Provider,
+		commitModel:  commitModel,
+		prModel:      prModel,
+		ollamaURL:    config.OllamaURL,
+		openaiURL:    config.OpenAIURL,
+		openaiAPIKey: config.OpenAIAPIKey,
+		configPath:   configPath,
 	}
 }
 
@@ -1468,10 +1621,14 @@ func (m configModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.input != "" {
 					m.prModel = m.input
 				}
-				if m.provider == "ollama" {
+				switch m.provider {
+				case "ollama":
 					m.phase = phaseOllamaURL
 					m.input = m.ollamaURL
-				} else {
+				case "openai":
+					m.phase = phaseOpenAIURL
+					m.input = m.openaiURL
+				default:
 					m.phase = phaseConfirm
 				}
 			case phaseOllamaURL:
@@ -1479,13 +1636,26 @@ func (m configModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.ollamaURL = m.input
 				}
 				m.phase = phaseConfirm
+			case phaseOpenAIURL:
+				if m.input != "" {
+					m.openaiURL = m.input
+				}
+				m.phase = phaseOpenAIAPIKey
+				m.input = m.openaiAPIKey
+			case phaseOpenAIAPIKey:
+				if m.input != "" {
+					m.openaiAPIKey = m.input
+				}
+				m.phase = phaseConfirm
 			case phaseConfirm:
 				// Save the config
 				newConfig := &Config{
-					Provider:    m.provider,
-					CommitModel: m.commitModel,
-					PRModel:     m.prModel,
-					OllamaURL:   m.ollamaURL,
+					Provider:     m.provider,
+					CommitModel:  m.commitModel,
+					PRModel:      m.prModel,
+					OllamaURL:    m.ollamaURL,
+					OpenAIURL:    m.openaiURL,
+					OpenAIAPIKey: m.openaiAPIKey,
 				}
 				// Set Model as fallback for backward compatibility
 				newConfig.Model = m.commitModel
@@ -1518,15 +1688,19 @@ func (m configModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.provider = "anthropic"
 				} else if key == "2" {
 					m.provider = "ollama"
+				} else if key == "3" {
+					m.provider = "openai"
 				}
 			case phaseConfirm:
 				if key == "y" {
 					// Save the config
 					newConfig := &Config{
-						Provider:    m.provider,
-						CommitModel: m.commitModel,
-						PRModel:     m.prModel,
-						OllamaURL:   m.ollamaURL,
+						Provider:     m.provider,
+						CommitModel:  m.commitModel,
+						PRModel:      m.prModel,
+						OllamaURL:    m.ollamaURL,
+						OpenAIURL:    m.openaiURL,
+						OpenAIAPIKey: m.openaiAPIKey,
 					}
 					// Set Model as fallback for backward compatibility
 					newConfig.Model = m.commitModel
@@ -1540,7 +1714,7 @@ func (m configModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else if key == "n" {
 					return m, tea.Quit
 				}
-			case phaseCommitModel, phasePRModel, phaseOllamaURL:
+			case phaseCommitModel, phasePRModel, phaseOllamaURL, phaseOpenAIURL, phaseOpenAIAPIKey:
 				m.input += key
 			}
 		}
@@ -1574,6 +1748,12 @@ func (m configModel) View() string {
 		if m.provider == "ollama" {
 			s += labelStyle.Render("Ollama URL:") + " " + m.ollamaURL + "\n"
 		}
+		if m.provider == "openai" {
+			s += labelStyle.Render("OpenAI URL:") + " " + m.openaiURL + "\n"
+			if m.openaiAPIKey != "" {
+				s += labelStyle.Render("OpenAI API Key:") + " configured\n"
+			}
+		}
 		s += "\n" + labelStyle.Render("Config file:") + " " + m.configPath + "\n\n"
 		s += "Press enter to exit\n"
 		return s
@@ -1581,7 +1761,7 @@ func (m configModel) View() string {
 
 	if m.phase == phaseProvider {
 		s := titleStyle.Render("Select LLM Provider") + "\n\n"
-		providers := []string{"anthropic", "ollama"}
+		providers := []string{"anthropic", "ollama", "openai"}
 		for _, p := range providers {
 			prefix := " "
 			if m.provider == p {
@@ -1590,14 +1770,17 @@ func (m configModel) View() string {
 			}
 			s += fmt.Sprintf("%s %s\n", prefix, p)
 		}
-		s += "\n(press 1 for anthropic, 2 for ollama, enter to continue)\n"
+		s += "\n(press 1 for anthropic, 2 for ollama, 3 for openai, enter to continue)\n"
 		return s
 	}
 
 	if m.phase == phaseCommitModel {
 		defaultModel := defaultAnthropicModel
-		if m.provider == "ollama" {
+		switch m.provider {
+		case "ollama":
 			defaultModel = defaultOllamaModel
+		case "openai":
+			defaultModel = defaultOpenAIModel
 		}
 		s := titleStyle.Render("Configure Commit Model") + "\n\n"
 		s += labelStyle.Render("Provider:") + " " + m.provider + "\n\n"
@@ -1610,8 +1793,11 @@ func (m configModel) View() string {
 
 	if m.phase == phasePRModel {
 		defaultModel := defaultAnthropicModel
-		if m.provider == "ollama" {
+		switch m.provider {
+		case "ollama":
 			defaultModel = defaultOllamaModel
+		case "openai":
+			defaultModel = defaultOpenAIModel
 		}
 		s := titleStyle.Render("Configure PR Model") + "\n\n"
 		s += labelStyle.Render("Provider:") + " " + m.provider + "\n"
@@ -1635,6 +1821,29 @@ func (m configModel) View() string {
 		return s
 	}
 
+	if m.phase == phaseOpenAIURL {
+		s := titleStyle.Render("Configure OpenAI-compatible Endpoint URL") + "\n\n"
+		s += labelStyle.Render("Provider:") + " openai\n"
+		s += labelStyle.Render("Commit model:") + " " + m.commitModel + "\n"
+		s += labelStyle.Render("PR model:") + " " + m.prModel + "\n\n"
+		s += "Enter endpoint base URL (e.g. http://localhost:4000):\n"
+		s += fmt.Sprintf("> %s_\n", m.input)
+		s += "\n(press enter when done)\n"
+		return s
+	}
+
+	if m.phase == phaseOpenAIAPIKey {
+		s := titleStyle.Render("Configure OpenAI-compatible API Key") + "\n\n"
+		s += labelStyle.Render("Provider:") + " openai\n"
+		s += labelStyle.Render("Commit model:") + " " + m.commitModel + "\n"
+		s += labelStyle.Render("PR model:") + " " + m.prModel + "\n"
+		s += labelStyle.Render("Endpoint URL:") + " " + m.openaiURL + "\n\n"
+		s += "Enter API key (or leave empty to use OPENAI_API_KEY env var):\n"
+		s += fmt.Sprintf("> %s_\n", m.input)
+		s += "\n(press enter when done)\n"
+		return s
+	}
+
 	if m.phase == phaseConfirm {
 		s := titleStyle.Render("Confirm Configuration") + "\n\n"
 		s += labelStyle.Render("Provider:") + " " + m.provider + "\n"
@@ -1642,6 +1851,14 @@ func (m configModel) View() string {
 		s += labelStyle.Render("PR model:") + " " + m.prModel + "\n"
 		if m.provider == "ollama" {
 			s += labelStyle.Render("Ollama URL:") + " " + m.ollamaURL + "\n"
+		}
+		if m.provider == "openai" {
+			s += labelStyle.Render("OpenAI URL:") + " " + m.openaiURL + "\n"
+			if m.openaiAPIKey != "" {
+				s += labelStyle.Render("OpenAI API Key:") + " " + m.openaiAPIKey[:min(8, len(m.openaiAPIKey))] + "..." + "\n"
+			} else {
+				s += labelStyle.Render("OpenAI API Key:") + " (from OPENAI_API_KEY env var)\n"
+			}
 		}
 		s += "\n" + labelStyle.Render("Config file:") + " " + m.configPath + "\n\n"
 		s += titleStyle.Render("Save this configuration?") + "\n\n"
@@ -1685,8 +1902,10 @@ OPTIONS:
     -m, --model <model>           Model to use for both commit and PR (overrides config)
     --commit-model <model>        Model for commit message generation (overrides config and -m)
     --pr-model <model>            Model for PR description generation (overrides config and -m)
-    -p, --provider <provider>     LLM provider: anthropic or ollama (overrides config)
+    -p, --provider <provider>     LLM provider: anthropic, ollama, or openai (overrides config)
     --ollama-url <url>            Ollama server URL (overrides config)
+    --openai-url <url>            OpenAI-compatible endpoint URL (overrides config)
+    --openai-api-key <key>        OpenAI-compatible API key (overrides config)
     --pr                          Generate a PR from existing commits (no commit required)
 
 SUBCOMMANDS:
@@ -1699,6 +1918,8 @@ EXAMPLES:
     gitcat --commit-model claude-haiku-3-5-20241022 --pr-model claude-sonnet-4-5-20250929
                                   Use a fast model for commits, smarter model for PRs
     gitcat -p ollama              Use Ollama provider
+    gitcat -p openai --openai-url http://localhost:4000 --openai-api-key sk-test
+                                  Use OpenAI-compatible provider (e.g. LiteLLM)
     gitcat --pr                   Generate a PR from current branch commits
     gitcat config                 Configure endpoints and settings
 
@@ -1709,7 +1930,8 @@ CONFIGURATION:
 
     Available providers:
       - anthropic: Requires ANTHROPIC_API_KEY environment variable
-      - ollama: Local Ollama instance for running open-source models`)
+      - ollama: Local Ollama instance for running open-source models
+      - openai: OpenAI-compatible API (e.g. LiteLLM proxy), requires endpoint URL and API key`)
 }
 
 func main() {
